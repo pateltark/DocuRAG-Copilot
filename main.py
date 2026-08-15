@@ -1,32 +1,39 @@
 import os
 import tempfile
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from jose import JWTError
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from agent.llm_agent import ask_upload,ask_sec
+from agent.llm_agent import ask_upload, ask_sec
 from rag.emb_chunks import create_vectorstore
 from auth import hash_password, verify_password, create_access_token, decode_token
-from rag.db import save_user_info, get_user_by_email, save_chat, save_emb, save_doc_info, get_user_documents, list_sec_documents, delete_document
-from agent.session import get_active_doc, get_active_doc, get_active_set
+from rag.db import (
+    save_user_info, get_user_by_email, save_chat, save_emb, 
+    save_doc_info, get_user_documents, list_sec_documents, 
+    delete_document, save_chat, load_chat, clear_chat
+)
+from agent.session import get_active_doc, get_active_set
 
 
 app = FastAPI(title="SEC Edgar Research API")
 
 security = HTTPBearer()
 
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 class QueryRequest(BaseModel):
@@ -50,13 +57,16 @@ class DocumentOut(BaseModel):
 
 MAX_COMPARE_DOCS = 5
 
+ALLOWED_EXTENSIONS = {
+    "pdf", "docx", "doc", "pptx", "xlsx", 
+    "csv", "txt", "md", "html", "png", "jpg", "jpeg"
+}
 
-# def get_current_user(token: str = Depends(oauth2_scheme)):
-#     try:
-#         payload = decode_token(token)
-#         return payload  
-#     except JWTError:
-#         raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+@app.get("/")
+def read_root():
+    return {"status": "ok"}
+
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security)
@@ -67,7 +77,6 @@ def get_current_user(
         return payload
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
-    
 
 
 @app.get("/documents", response_model=list[DocumentOut])
@@ -94,37 +103,42 @@ def login(body: LoginRequest):
     return {"access_token": token, "token_type": "bearer"}
 
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...), user=Depends(get_current_user)):
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files accepted.")
+async def upload_document(file: UploadFile = File(...), user=Depends(get_current_user)):
+    filename = file.filename or ""
+    ext = filename.split(".")[-1].lower() if "." in filename else ""
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format '.{ext}'. Allowed formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+
+    # Preserve exact file extension for Docling parser auto-detection
+    file_suffix = f".{ext}" if ext else ""
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
     try:
-        doc_id = save_doc_info(user["sub"], file.filename)  # real filename, get id back FIRST
-        create_vectorstore(tmp_path, user["sub"], document_id=doc_id)  # then embed, tagged with doc_id
+        doc_id = save_doc_info(user["sub"], file.filename)  # save metadata
+        create_vectorstore(tmp_path, user["sub"], document_id=doc_id)  # run Docling + chunking
     finally:
         os.unlink(tmp_path)
 
-    return {"message": "PDF indexed successfully.", "document_id": doc_id}
+    return {"message": "Document indexed successfully.", "document_id": doc_id}
 
 
 @app.delete("/upload")
 def clear_pdf(user=Depends(get_current_user)):
-
     pdf_ready = False
     return {"message": "PDF cleared."}
-
 
 
 @app.post("/chat/doc")
@@ -153,7 +167,6 @@ async def chat_with_doc(req: QueryRequest, user=Depends(get_current_user)):
     return {"answer": answer}
 
 
-
 @app.post("/chat/sec")
 async def chat_with_sec(req: QueryRequest, user=Depends(get_current_user)):
     user_id = user["sub"]
@@ -165,7 +178,6 @@ async def chat_with_sec(req: QueryRequest, user=Depends(get_current_user)):
         "active_doc": get_active_doc(user_id),
         "active_set": get_active_set(user_id),
     } 
-
 
 
 @app.get("/sec/active")
@@ -186,3 +198,29 @@ def sec_documents(user=Depends(get_current_user)):
 def delete_document_route(document_id: str, user=Depends(get_current_user)):
     delete_document(user_id=user["sub"], document_id=document_id)
     return {"message": "Document deleted."}
+
+
+@app.get("/chat/history")
+async def get_history(
+    mode: str = Query("sec", description="Chat mode: 'sec' or 'doc'"),
+    user=Depends(get_current_user),
+):
+    user_id = user["sub"]
+    if mode not in ["sec", "doc"]:
+        raise HTTPException(status_code=400, detail="Invalid chat mode")
+    
+    messages = load_chat(user_id=user_id, mode=mode)
+    return {"messages": messages}
+
+
+@app.delete("/chat/history")
+async def clear_history(
+    mode: str = Query("sec", description="Chat mode: 'sec' or 'doc'"),
+    user=Depends(get_current_user),
+):
+    user_id = user["sub"]
+    if mode not in ["sec", "doc"]:
+        raise HTTPException(status_code=400, detail="Invalid chat mode")
+        
+    clear_chat(user_id=user_id, mode=mode)
+    return {"status": "success", "message": f"Cleared history for {mode} mode"}

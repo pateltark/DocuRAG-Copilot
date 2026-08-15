@@ -8,7 +8,14 @@ from psycopg2 import pool
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
+
+import os
+import psycopg2.pool
+from dotenv import load_dotenv
+
+# Load variables from .env file into os.environ
 load_dotenv()
+
 
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
@@ -31,7 +38,6 @@ connection_pool = psycopg2.pool.ThreadedConnectionPool(
     host=os.getenv("DB_HOST", "localhost"),
     port=int(os.getenv("DB_PORT", "5432")),
 )
-
 
 @contextmanager
 def get_db():
@@ -588,3 +594,17 @@ def load_chat(user_id, mode=None):
             )
         rows = cursor.fetchall()
     return [{"role": "user" if role == "user" else "assistant", "content": content} for role, content in rows]
+
+
+def clear_chat(user_id: str, mode: str = None):
+    with get_db() as cursor:
+        if mode:
+            cursor.execute(
+                "DELETE FROM chat_history WHERE user_id = %s AND mode = %s",
+                (user_id, mode),
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM chat_history WHERE user_id = %s",
+                (user_id,),
+            )

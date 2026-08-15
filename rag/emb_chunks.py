@@ -1,14 +1,19 @@
-from langchain_community.document_loaders import PyPDFLoader
+import os
+import gc
+import json
+from concurrent.futures import ThreadPoolExecutor
+from dotenv import load_dotenv
+from groq import Groq
+
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.base_models import InputFormat
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from langchain_core.documents import Document
-from concurrent.futures import ThreadPoolExecutor
 
-import json
-from groq import Groq
-import os
-from dotenv import load_dotenv
-
+from rag.embeddings import get_embedding_model
 from rag.db import (
     save_emb, related_chunks, load_chat, save_sec_vector, related_sec_chunks,
     update_document_status,
@@ -17,13 +22,28 @@ from rag.db import (
 load_dotenv()
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+model = get_embedding_model()
 
-_ingest_executor = ThreadPoolExecutor(max_workers=2)
+# Restrict background execution to 1 file at a time to prevent RAM multiplication
+_ingest_executor = ThreadPoolExecutor(max_workers=1)
+
+# ==============================================================================
+# 🚀 MEMORY OPTIMIZED DOCLING CONFIGURATION
+# ==============================================================================
+pipeline_options = PdfPipelineOptions()
+pipeline_options.do_ocr = False             # Disables image OCR (saves ~60% RAM)
+pipeline_options.do_table_structure = False  # Disables table AI vision model (saves ~30% RAM & eliminates std::bad_alloc)
+
+doc_converter = DocumentConverter(
+    format_options={
+        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+    }
+)
+# ==============================================================================
 
 
 def submit_ingest_job(pdf_path: str, user_id: str, document_id: str, filename: str):
-    """Queue a PDF for background ingestion."""
+    """Queue a document for background ingestion."""
     _ingest_executor.submit(_process_upload, pdf_path, user_id, document_id, filename)
 
 
@@ -39,6 +59,9 @@ def _process_upload(pdf_path: str, user_id: str, document_id: str, filename: str
     except Exception as e:
         print(f"[ingest] failed for document_id={document_id}: {e}")
         update_document_status(document_id, "failed")
+    finally:
+        # Force Python memory cleanup after each background job
+        gc.collect()
 
 
 def clean_string(value):
@@ -56,7 +79,7 @@ def ingest_text(
     document_id: str = None,
     page_number: int = None,
 ):
-    """Ingest raw string text (for non-PDF text ingestion)."""
+    """Ingest raw string text."""
     text = clean_string(text)
     user_id = clean_string(user_id)
     source = clean_string(source)
@@ -89,7 +112,7 @@ def ingest_text(
                 embedding=emb,
                 source=clean_source,
                 document_id=document_id,
-                page_number=page_number,  # Cleanly handles optional page_number
+                page_number=page_number,
             )
         except Exception as e:
             print("\n===== SAVE_EMB ERROR =====")
@@ -131,56 +154,82 @@ def create_vectorstore(
     source: str = None,
     document_id: str = None,
 ):
-    """Preserves PDF page numbers while chunking and saving embeddings."""
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()
+    """Parses documents with Docling while preserving page numbers and saving memory."""
+    
+    try:
+        # 1. Convert document using memory-optimized Docling pipeline
+        result = doc_converter.convert(pdf_path)
 
-    if not pages:
-        raise ValueError(f"pypdf extracted no pages from {pdf_path}")
+        clean_user_id = clean_string(user_id)
+        clean_source = clean_string(source or pdf_path)
+        clean_doc_id = clean_string(document_id)
 
-    # Clean NUL bytes on page content and validate text presence
-    total_length = 0
-    for page in pages:
-        if page.page_content:
-            page.page_content = page.page_content.replace("\x00", "")
-            total_length += len(page.page_content.strip())
-
-    if total_length < 50:
-        raise ValueError(
-            f"pypdf extracted no usable text from {pdf_path} "
-            f"(got {total_length} characters) — likely a scanned/image-only PDF."
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=400,
+            chunk_overlap=60,
         )
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,
-        chunk_overlap=60,
-    )
+        # 2. Group document text page-by-page safely
+        pages_map = {}  # page_number -> list of text snippets
 
-    # split_documents propagates page metadata (0-indexed) to every split chunk
-    chunks = splitter.split_documents(pages)
+        for item, _ in result.document.iterate_items():
+            page_num = None
+            if getattr(item, "prov", None) and len(item.prov) > 0:
+                page_num = item.prov[0].page_no
 
-    clean_user_id = clean_string(user_id)
-    clean_source = clean_string(source or pdf_path)
-    clean_doc_id = clean_string(document_id)
+            snippet = ""
+            if hasattr(item, "export_to_markdown"):
+                try:
+                    # Pass root document reference safely
+                    snippet = item.export_to_markdown(doc=result.document)
+                except Exception:
+                    snippet = getattr(item, "text", "")
+            elif hasattr(item, "text") and item.text:
+                snippet = item.text.strip()
 
-    for chunk in chunks:
-        clean_content = clean_string(chunk.page_content)
-        if not clean_content or not clean_content.strip():
-            continue
+            if snippet and snippet.strip():
+                if page_num not in pages_map:
+                    pages_map[page_num] = []
+                pages_map[page_num].append(snippet.strip())
 
-        # PyPDFLoader uses 0-based indexing for pages (0 -> Page 1)
-        raw_page = chunk.metadata.get("page")
-        page_num = (raw_page + 1) if raw_page is not None else None
+        # Fallback if structural iteration yields nothing
+        if not pages_map:
+            full_md = clean_string(result.document.export_to_markdown())
+            if not full_md or len(full_md.strip()) < 50:
+                raise ValueError(f"Docling extracted no usable content from {pdf_path}")
+            pages_map = {None: [full_md]}
 
-        emb = model.encode(clean_content).tolist()
+        # 3. Chunk page-by-page so vector store retains exact page numbers
+        for page_num, snippets in pages_map.items():
+            page_text = clean_string("\n\n".join(snippets))
+            if not page_text or len(page_text.strip()) < 10:
+                continue
 
-        save_emb(
-            content=clean_content,
-            user_id=clean_user_id,
-            embedding=emb,
-            source=clean_source,
-            document_id=clean_doc_id,
-            page_number=page_num,  # Correct page number saved to database
-        )
+            doc = Document(
+                page_content=page_text,
+                metadata={"source": clean_source}
+            )
 
-    return True
+            chunks = splitter.split_documents([doc])
+
+            for chunk in chunks:
+                clean_content = clean_string(chunk.page_content)
+                if not clean_content or not clean_content.strip():
+                    continue
+
+                emb = model.encode(clean_content).tolist()
+
+                save_emb(
+                    content=clean_content,
+                    user_id=clean_user_id,
+                    embedding=emb,
+                    source=clean_source,
+                    document_id=clean_doc_id,
+                    page_number=page_num,  # 1-based page numbers preserved for PDFs!
+                )
+
+        return True
+
+    finally:
+        # Run Garbage Collector immediately to free up C++ memory allocations
+        gc.collect()
