@@ -7,3 +7,6 @@ data/parsed/
 data/raw
 edgar_docs/
 chroma_db/
+Dockerfile
+docker-compose.yml
+frontend/Dockerfile

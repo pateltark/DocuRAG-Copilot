@@ -8,8 +8,6 @@ from groq import Groq
 import os
 from dotenv import load_dotenv
 
-from db import save_emb, related_chunks, load_chat
-
 from rag.db import related_chunks
 
 

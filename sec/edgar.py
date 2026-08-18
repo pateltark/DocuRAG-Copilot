@@ -2,7 +2,7 @@
 import os, json, requests
 from dotenv import load_dotenv
 from groq import Groq
-from db import load_chat
+from rag.db import load_chat
 
 load_dotenv()
 

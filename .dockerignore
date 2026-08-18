@@ -1,0 +1,22 @@
+# Python & Virtual Environments
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node.js & Next.js Builds
+**/node_modules/
+frontend/.next/
+frontend/out/
+
+# Local Data & Heavy Files
+edgar_docs/
+*.pdf
+*.doc   
+dump.rdb
+
+# System & Git
+.git/
+.vscode/
+.env
