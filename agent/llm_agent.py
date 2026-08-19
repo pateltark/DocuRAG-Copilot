@@ -236,7 +236,7 @@ def generate_answer(
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Context:\n{formatted_context}\n\nQuestion: {question}"}

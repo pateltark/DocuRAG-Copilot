@@ -107,26 +107,21 @@ return
 # ======================================================
 
 def planner(question: str) -> PlannerOutput:
+    # Append schema requirements directly to prompt
+    json_schema_prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        "You MUST respond ONLY with a valid JSON object matching this schema:\n"
+        f"{PlannerOutput.model_json_schema()}"
+    )
 
     response = client.chat.completions.create(
-
-        model="llama-3.3-70b-versatile",
-
+        model="openai/gpt-oss-120b", # Note: use standard groq models like llama-3.3-70b
         temperature=0,
-
-        tool_choice={
-            "type": "function",
-            "function": {
-                "name": "extract_document"
-            }
-        },
-
-        tools=TOOLS,
-
+        response_format={"type": "json_object"},  # Enforces valid JSON without breaking on tool choices
         messages=[
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT
+                "content": json_schema_prompt
             },
             {
                 "role": "user",
@@ -135,17 +130,13 @@ def planner(question: str) -> PlannerOutput:
         ]
     )
 
-    tool_call = response.choices[0].message.tool_calls[0]
+    raw_json = response.choices[0].message.content
 
-    args = json.loads(
-        tool_call.function.arguments
-    )
+    print("\nLLM Output\n")
+    print(raw_json)
 
-    print("\nTool Output\n")
-    print(json.dumps(args, indent=4))
-
-    return PlannerOutput.model_validate(args)
-
+    # Directly validate with Pydantic
+    return PlannerOutput.model_validate_json(raw_json)
 
 
 

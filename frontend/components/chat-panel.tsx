@@ -11,22 +11,46 @@ import {
   chatSec,
   clearHistory,
   getHistory,
+  secActive,
+  type ActiveDoc,
   type ChatMessage,
 } from "@/lib/api"
 import { ArrowUp, Eraser, Loader2 } from "lucide-react"
 
 type Mode = "sec" | "doc"
 
+// active_set's shape isn't pinned down yet, so render it defensively —
+// never dump a raw object into JSX (that's what crashed last time).
+function formatActiveSet(activeSet: unknown): string | null {
+  if (activeSet == null) return null
+  if (typeof activeSet === "string") return activeSet
+  if (Array.isArray(activeSet)) {
+    if (activeSet.length === 0) return null
+    return `${activeSet.length} filing${activeSet.length > 1 ? "s" : ""}`
+  }
+  if (typeof activeSet === "object") {
+    return "comparing a set"
+  }
+  return String(activeSet)
+}
+
 export function ChatPanel({
   mode,
   selectedDocumentIds,
+  chatId,
+  onChatIdChange,
 }: {
   mode: Mode
   selectedDocumentIds: string[]
+  /** null = unsaved "new chat" — no history to load yet */
+  chatId: string | null
+  /** Called with the real chat_id once the first message lands, and with
+   * null after the current chat is cleared/deleted. */
+  onChatIdChange: (chatId: string | null) => void
 }) {
   const { data, isLoading, mutate } = useSWR(
-    ["history", mode],
-    () => getHistory(mode).then((r) => r.messages),
+    ["history", mode, chatId],
+    () => (chatId ? getHistory(mode, chatId).then((r) => r.messages) : Promise.resolve([] as ChatMessage[])),
     { revalidateOnFocus: false },
   )
 
@@ -34,6 +58,8 @@ export function ChatPanel({
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [clearing, setClearing] = useState(false)
+  const [activeDoc, setActiveDoc] = useState<ActiveDoc>(null)
+  const [activeSet, setActiveSet] = useState<unknown>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   const messages = data ?? []
@@ -41,6 +67,25 @@ export function ChatPanel({
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
   }, [messages, sending])
+
+  // Restore active doc/set on mount and whenever we switch into SEC mode
+  // (e.g. after a page refresh), since chat-panel remounts per mode.
+  useEffect(() => {
+    if (mode !== "sec") return
+    let cancelled = false
+    secActive()
+      .then((res) => {
+        if (cancelled) return
+        setActiveDoc(res.active_doc ?? null)
+        setActiveSet(res.active_set ?? null)
+      })
+      .catch(() => {
+        // non-critical — leave badge empty if this fails
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [mode])
 
   async function send() {
     const question = input.trim()
@@ -55,11 +100,19 @@ export function ChatPanel({
 
     try {
       if (mode === "sec") {
-        const res = await chatSec(question)
+        const res = await chatSec(question, chatId ?? undefined)
         mutate([...optimistic, { role: "assistant", content: res.answer }], { revalidate: false })
+        setActiveDoc(res.active_doc ?? null)
+        setActiveSet(res.active_set ?? null)
+        onChatIdChange(res.chat_id)
       } else {
-        const res = await chatDoc(question, selectedDocumentIds.length ? selectedDocumentIds : undefined)
+        const res = await chatDoc(
+          question,
+          chatId ?? undefined,
+          selectedDocumentIds.length ? selectedDocumentIds : undefined,
+        )
         mutate([...optimistic, { role: "assistant", content: res.answer }], { revalidate: false })
+        onChatIdChange(res.chat_id)
       }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to get a response.")
@@ -75,8 +128,11 @@ export function ChatPanel({
     setClearing(true)
     setError(null)
     try {
-      await clearHistory(mode)
+      if (chatId) {
+        await clearHistory(mode, chatId)
+      }
       mutate([], { revalidate: false })
+      onChatIdChange(null) // back to a fresh "new chat" state
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to clear history.")
     } finally {
@@ -92,6 +148,11 @@ export function ChatPanel({
     }
   }
 
+  const activeSetLabel = formatActiveSet(activeSet)
+  const activeLabel = activeDoc
+    ? `${activeDoc.ticker} · ${activeDoc.form_type}`
+    : activeSetLabel
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b border-border px-6 py-4">
@@ -106,6 +167,12 @@ export function ChatPanel({
                 ? `Comparing ${selectedDocumentIds.length} selected document${selectedDocumentIds.length > 1 ? "s" : ""}.`
                 : "Ask questions about your uploaded documents."}
           </p>
+          {mode === "sec" && activeLabel && (
+            <div className="mt-1.5 inline-flex items-center gap-1.5 rounded-full border border-border bg-muted px-2.5 py-0.5 text-[11px] text-muted-foreground">
+              <span className="size-1.5 rounded-full bg-emerald-500" aria-hidden="true" />
+              Active: {activeLabel}
+            </div>
+          )}
         </div>
         <Button
           variant="ghost"

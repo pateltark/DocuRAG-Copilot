@@ -1,4 +1,5 @@
 import os
+import uuid
 import tempfile
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +12,9 @@ from agent.llm_agent import ask_upload, ask_sec
 from rag.emb_chunks import create_vectorstore
 from auth import hash_password, verify_password, create_access_token, decode_token
 from rag.db import (
-    save_user_info, get_user_by_email, save_chat, save_emb, 
-    save_doc_info, get_user_documents, list_sec_documents, 
-    delete_document, save_chat, load_chat, clear_chat
+    save_user_info, get_user_by_email, get_user_by_id, save_chat, save_emb,
+    save_doc_info, get_user_documents, list_sec_documents,
+    delete_document, save_chat, load_chat, clear_chat, list_chats
 )
 from agent.session import get_active_doc, get_active_set
 
@@ -39,6 +40,7 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
     document_ids: list[str] | None = None
+    chat_id: str | None = None  # None => start a new chat section
 
 class RegisterRequest(BaseModel):
     user_id: str
@@ -103,6 +105,14 @@ def login(body: LoginRequest):
     return {"access_token": token, "token_type": "bearer"}
 
 
+@app.get("/auth/me")
+def get_me(user=Depends(get_current_user)):
+    info = get_user_by_id(user["sub"])
+    if not info:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return info
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -119,7 +129,6 @@ async def upload_document(file: UploadFile = File(...), user=Depends(get_current
             detail=f"Unsupported file format '.{ext}'. Allowed formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
         )
 
-    # Preserve exact file extension for Docling parser auto-detection
     file_suffix = f".{ext}" if ext else ""
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
@@ -127,8 +136,8 @@ async def upload_document(file: UploadFile = File(...), user=Depends(get_current
         tmp_path = tmp.name
 
     try:
-        doc_id = save_doc_info(user["sub"], file.filename)  # save metadata
-        create_vectorstore(tmp_path, user["sub"], document_id=doc_id)  # run Docling + chunking
+        doc_id = save_doc_info(user["sub"], file.filename)
+        create_vectorstore(tmp_path, user["sub"], document_id=doc_id)
     finally:
         os.unlink(tmp_path)
 
@@ -150,31 +159,33 @@ async def chat_with_doc(req: QueryRequest, user=Depends(get_current_user)):
         )
 
     user_id = user["sub"]
-    
-    # Save user message to history under 'doc' mode
-    save_chat(user_id=user_id, role="user", content=req.question, mode="doc")
-    
-    # Generate Answer
+    chat_id = req.chat_id or str(uuid.uuid4())  # new chat section if none passed
+
+    save_chat(user_id=user_id, role="user", content=req.question, mode="doc", chat_id=chat_id)
+
     answer = ask_upload(
         question=req.question, 
         user_id=user_id, 
         document_ids=req.document_ids
     )
-    
-    # Save bot answer to history under 'doc' mode
-    save_chat(user_id=user_id, role="assistant", content=answer, mode="doc")
-    
-    return {"answer": answer}
+
+    save_chat(user_id=user_id, role="assistant", content=answer, mode="doc", chat_id=chat_id)
+
+    return {"answer": answer, "chat_id": chat_id}
 
 
 @app.post("/chat/sec")
 async def chat_with_sec(req: QueryRequest, user=Depends(get_current_user)):
     user_id = user["sub"]
-    save_chat(user_id=user_id, role="user", content=req.question, mode="sec")
+    chat_id = req.chat_id or str(uuid.uuid4())  # new chat section if none passed
+
+    save_chat(user_id=user_id, role="user", content=req.question, mode="sec", chat_id=chat_id)
     answer = ask_sec(question=req.question, user_id=user_id)
-    save_chat(user_id=user_id, role="assistant", content=answer, mode="sec")
+    save_chat(user_id=user_id, role="assistant", content=answer, mode="sec", chat_id=chat_id)
+
     return {
         "answer": answer,
+        "chat_id": chat_id,
         "active_doc": get_active_doc(user_id),
         "active_set": get_active_set(user_id),
     } 
@@ -200,27 +211,42 @@ def delete_document_route(document_id: str, user=Depends(get_current_user)):
     return {"message": "Document deleted."}
 
 
+# ── Chat sections (sidebar) ────────────────────────────────
+@app.get("/chat/sessions")
+def get_chat_sessions(
+    mode: str = Query("sec", description="Chat mode: 'sec' or 'doc'"),
+    user=Depends(get_current_user),
+):
+    if mode not in ["sec", "doc"]:
+        raise HTTPException(status_code=400, detail="Invalid chat mode")
+    return list_chats(user_id=user["sub"], mode=mode)
+
+
+# ── Chat history (single section) ──────────────────────────
 @app.get("/chat/history")
 async def get_history(
     mode: str = Query("sec", description="Chat mode: 'sec' or 'doc'"),
+    chat_id: str | None = Query(None, description="If omitted, returns all messages for the mode"),
     user=Depends(get_current_user),
 ):
     user_id = user["sub"]
     if mode not in ["sec", "doc"]:
         raise HTTPException(status_code=400, detail="Invalid chat mode")
-    
-    messages = load_chat(user_id=user_id, mode=mode)
+
+    messages = load_chat(user_id=user_id, mode=mode, chat_id=chat_id)
     return {"messages": messages}
 
 
 @app.delete("/chat/history")
 async def clear_history(
     mode: str = Query("sec", description="Chat mode: 'sec' or 'doc'"),
+    chat_id: str | None = Query(None, description="If omitted, clears all chats for the mode"),
     user=Depends(get_current_user),
 ):
     user_id = user["sub"]
     if mode not in ["sec", "doc"]:
         raise HTTPException(status_code=400, detail="Invalid chat mode")
-        
-    clear_chat(user_id=user_id, mode=mode)
-    return {"status": "success", "message": f"Cleared history for {mode} mode"}
+
+    clear_chat(user_id=user_id, mode=mode, chat_id=chat_id)
+    msg = f"Cleared chat {chat_id}" if chat_id else f"Cleared all history for {mode} mode"
+    return {"status": "success", "message": msg}

@@ -1,18 +1,32 @@
 "use client"
 
-import { useState } from "react"
-import { Button } from "@/components/ui/button"
+import { useEffect, useState } from "react"
 import { ChatPanel } from "@/components/chat-panel"
+import { ChatSidebar } from "@/components/chat-sidebar"
 import { DocumentManager } from "@/components/document-manager"
-import { useAuth } from "@/lib/auth-context"
-import { FileSearch, FileText, Landmark, LogOut } from "lucide-react"
+import { UserMenu } from "@/components/user-menu"
+import { FileSearch, FileText, Landmark } from "lucide-react"
 
 type Mode = "sec" | "doc"
 
 export function Workspace() {
-  const { logout } = useAuth()
   const [mode, setMode] = useState<Mode>("sec")
   const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [activeChatId, setActiveChatId] = useState<string | null>(null)
+  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0)
+
+  // Switching modes means switching chat lists — start fresh each time.
+  useEffect(() => {
+    setActiveChatId(null)
+  }, [mode])
+
+  function handleChatIdChange(id: string | null) {
+    setActiveChatId(id)
+    // A message was sent (id is non-null) — the sidebar's list/title/order
+    // may now be stale, so refetch it. No need to bump on `null` (a clear),
+    // since a cleared chat_id disappears from the list on its own next load.
+    if (id) setSidebarRefreshKey((k) => k + 1)
+  }
 
   return (
     <div className="flex h-svh bg-background">
@@ -54,16 +68,30 @@ export function Workspace() {
         </div>
 
         <div className="border-t border-border p-3">
-          <Button variant="ghost" size="sm" className="w-full justify-start" onClick={logout}>
-            <LogOut className="size-4" aria-hidden="true" />
-            Sign out
-          </Button>
+          <UserMenu />
         </div>
       </aside>
 
+      {/* Chat sessions list for the current mode */}
+      <ChatSidebar
+        mode={mode}
+        activeChatId={activeChatId}
+        onSelectChat={setActiveChatId}
+        onNewChat={() => setActiveChatId(null)}
+        refreshKey={sidebarRefreshKey}
+      />
+
       <main className="flex-1 overflow-hidden">
-        {/* Keying by mode remounts the panel so history reloads per mode. */}
-        <ChatPanel key={mode} mode={mode} selectedDocumentIds={selectedIds} />
+        {/* Keying by mode remounts the panel so history reloads per mode.
+            chatId itself is handled inside ChatPanel via the SWR key, so it
+            doesn't need to be part of this key. */}
+        <ChatPanel
+          key={mode}
+          mode={mode}
+          selectedDocumentIds={selectedIds}
+          chatId={activeChatId}
+          onChatIdChange={handleChatIdChange}
+        />
       </main>
     </div>
   )

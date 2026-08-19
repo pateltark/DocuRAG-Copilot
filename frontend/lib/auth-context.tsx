@@ -1,10 +1,19 @@
 "use client"
 
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react"
-import { clearToken, getToken, login as apiLogin, register as apiRegister, setToken } from "@/lib/api"
+import {
+  clearToken,
+  getToken,
+  getMe,
+  login as apiLogin,
+  register as apiRegister,
+  setToken,
+  type CurrentUser,
+} from "@/lib/api"
 
 type AuthContextValue = {
   token: string | null
+  user: CurrentUser | null
   ready: boolean
   isAuthenticated: boolean
   login: (email: string, password: string) => Promise<void>
@@ -16,17 +25,31 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setTokenState] = useState<string | null>(null)
+  const [user, setUser] = useState<CurrentUser | null>(null)
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    setTokenState(getToken())
-    setReady(true)
+    const existing = getToken()
+    setTokenState(existing)
+    if (existing) {
+      getMe()
+        .then(setUser)
+        .catch(() => setUser(null))
+        .finally(() => setReady(true))
+    } else {
+      setReady(true)
+    }
   }, [])
 
   async function login(email: string, password: string) {
     const res = await apiLogin({ email, password })
     setToken(res.access_token)
     setTokenState(res.access_token)
+    try {
+      setUser(await getMe())
+    } catch {
+      setUser(null)
+    }
   }
 
   async function register(input: { email: string; password: string; name: string }) {
@@ -42,12 +65,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   function logout() {
     clearToken()
     setTokenState(null)
+    setUser(null)
   }
 
   return (
     <AuthContext.Provider
       value={{
         token,
+        user,
         ready,
         isAuthenticated: Boolean(token),
         login,

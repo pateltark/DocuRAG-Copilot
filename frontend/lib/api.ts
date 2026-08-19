@@ -90,15 +90,40 @@ export type ChatMessage = {
   content: string
 }
 
+export type ChatSession = {
+  chat_id: string
+  title: string
+  started_at: string
+  updated_at: string
+}
+
 export type UserDocument = {
   id: string
   filename: string
 }
 
+export type ActiveDoc = {
+  document_id: string
+  ticker: string
+  form_type: string
+} | null
+
 export type SecChatResponse = {
   answer: string
-  active_doc: unknown
+  chat_id: string
+  active_doc: ActiveDoc
   active_set: unknown
+}
+
+export type DocChatResponse = {
+  answer: string
+  chat_id: string
+}
+
+export type CurrentUser = {
+  user_id: string
+  email: string
+  name: string
 }
 
 // ---- Auth ----
@@ -121,6 +146,10 @@ export function login(input: { email: string; password: string }) {
     body: input,
     auth: false,
   })
+}
+
+export function getMe() {
+  return request<CurrentUser>("/auth/me")
 }
 
 export function health() {
@@ -152,31 +181,40 @@ export function deleteDocument(documentId: string) {
   })
 }
 
+// ---- Chat sections (sidebar) ----
+export function listChatSessions(mode: "sec" | "doc") {
+  return request<ChatSession[]>(`/chat/sessions?mode=${mode}`)
+}
+
 // ---- Chat ----
-export function chatDoc(question: string, documentIds?: string[]) {
-  return request<{ answer: string }>("/chat/doc", {
+// Pass chatId to continue an existing thread; omit/undefined to start a new one.
+// The response's chat_id is the one to persist client-side going forward.
+export function chatDoc(question: string, chatId?: string, documentIds?: string[]) {
+  return request<DocChatResponse>("/chat/doc", {
     method: "POST",
-    body: { question, document_ids: documentIds ?? null },
+    body: { question, document_ids: documentIds ?? null, chat_id: chatId ?? null },
   })
 }
 
-export function chatSec(question: string) {
+export function chatSec(question: string, chatId?: string) {
   return request<SecChatResponse>("/chat/sec", {
     method: "POST",
-    body: { question, document_ids: null },
+    body: { question, document_ids: null, chat_id: chatId ?? null },
   })
 }
 
 export function secActive() {
-  return request<{ active_doc: unknown; active_set: unknown }>("/sec/active")
+  return request<{ active_doc: ActiveDoc; active_set: unknown }>("/sec/active")
 }
 
-export function getHistory(mode: "sec" | "doc") {
-  return request<{ messages: ChatMessage[] }>(`/chat/history?mode=${mode}`)
+export function getHistory(mode: "sec" | "doc", chatId?: string) {
+  const q = chatId ? `?mode=${mode}&chat_id=${chatId}` : `?mode=${mode}`
+  return request<{ messages: ChatMessage[] }>(`/chat/history${q}`)
 }
 
-export function clearHistory(mode: "sec" | "doc") {
-  return request<{ status: string; message: string }>(`/chat/history?mode=${mode}`, {
+export function clearHistory(mode: "sec" | "doc", chatId?: string) {
+  const q = chatId ? `?mode=${mode}&chat_id=${chatId}` : `?mode=${mode}`
+  return request<{ status: string; message: string }>(`/chat/history${q}`, {
     method: "DELETE",
   })
 }

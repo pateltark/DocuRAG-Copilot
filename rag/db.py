@@ -20,15 +20,6 @@ load_dotenv()
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 # ── Connection pool ─────────────────────────────────────────
-# Replaces the old single shared `conn`/`cursor` globals. Each request now
-# borrows its own connection from the pool and returns it when done, so
-# concurrent requests (FastAPI's threadpool, multiple uvicorn workers, or
-# multiple ECS/EC2 tasks all pointed at the same DB) don't share a cursor.
-#
-# All credentials now come from environment variables — set these in your
-# docker-compose.yml / ECS task definition / .env (gitignored), never
-# hardcoded. If "Login@100" was ever a real password, rotate it — it was
-# committed to the public repo.
 connection_pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=1,
     maxconn=int(os.getenv("DB_POOL_MAX", "10")),
@@ -148,6 +139,15 @@ def _run_migrations():
         cursor.execute("ALTER TABLE chat_emb ADD COLUMN IF NOT EXISTS page_number INTEGER;")
         cursor.execute("ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS mode VARCHAR(20) DEFAULT 'sec';")
         cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ready';")
+
+        # ── NEW: chat_id groups messages into a "chat section" (sidebar entry).
+        # Nullable so old rows (pre-migration) don't break; new chats always set it.
+        cursor.execute("ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS chat_id UUID;")
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS chat_history_chat_id_idx
+            ON chat_history(user_id, mode, chat_id, created_at);
+        """)
+
         cursor.execute("""
                     CREATE INDEX IF NOT EXISTS chat_emb_vector_idx
                     ON chat_emb
@@ -259,7 +259,6 @@ def related_sec_chunks(document_id: int, question: str, k: int = 5, k_rrf: int =
         ))
         rows = cursor.fetchall()
 
-    # Returns [(content, ticker, form_type, filename, distance), ...]
     return [(row[0], row[1], row[2], row[3], row[4]) for row in rows]
 
 
@@ -349,6 +348,18 @@ def get_user_by_email(email):
     return {"user_id": row[0], "email": row[1], "pass_word": row[2], "name": row[3]}
 
 
+def get_user_by_id(user_id):
+    with get_db() as cursor:
+        cursor.execute(
+            "SELECT user_id, email, name FROM user_login WHERE user_id = %s",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return {"user_id": row[0], "email": row[1], "name": row[2]}
+
+
 # ── Uploaded PDF documents ──────────────────────────────────
 def save_doc_info(user_id, pdf_name, status="processing"):
     doc_id = str(uuid.uuid4())
@@ -396,8 +407,6 @@ def get_user_documents(user_id):
 
 
 def delete_document(user_id, document_id):
-    # Scoped to user_id so a user can only delete their own documents,
-    # even if they somehow got hold of another user's document_id.
     with get_db() as cursor:
         cursor.execute(
             "DELETE FROM chat_emb WHERE user_id = %s AND document_id = %s",
@@ -425,7 +434,6 @@ def save_emb(content, user_id, embedding, source=None, document_id=None, page_nu
 def related_chunks(user_id: str, question: str, k: int = 4, document_ids: list[str] | None = None, k_rrf: int = 60):
     query_embedding = json.dumps(model.encode(question).tolist())
     
-    # Dynamic SQL WHERE filters depending on document_ids presence
     doc_filter = "AND document_id = ANY(%s)" if document_ids else ""
     params_semantic = [query_embedding, query_embedding, user_id]
     if document_ids:
@@ -476,7 +484,6 @@ def related_chunks(user_id: str, question: str, k: int = 4, document_ids: list[s
         cursor.execute(sql, all_params)
         rows = cursor.fetchall()
 
-    # Returns [(content, page_number, distance), ...] matching existing format
     return [(row[0], row[1], row[2]) for row in rows]
 
 
@@ -484,12 +491,11 @@ def related_chunks_per_doc(
     user_id: str, 
     question: str, 
     document_ids: list[str], 
-    k_per_doc: int = 10,   # 1. Increased default candidate count from 4 to 10
+    k_per_doc: int = 10,
     k_rrf: int = 60
 ):
     query_embedding = json.dumps(model.encode(question).tolist())
     
-    # 2. Scale CTE limit so RRF always has enough depth to fuse semantic + keyword results
     cte_limit = max(30, k_per_doc * 3)
     
     results = []
@@ -547,10 +553,10 @@ def related_chunks_per_doc(
             cursor.execute(
                 sql,
                 (
-                    query_embedding, query_embedding, user_id, doc_id, cte_limit,  # Semantic params
-                    question, user_id, doc_id, cte_limit,                         # Keyword params
-                    k_rrf, k_rrf,                                                 # RRF constant params
-                    k_per_doc                                                     # Final return limit per doc
+                    query_embedding, query_embedding, user_id, doc_id, cte_limit,
+                    question, user_id, doc_id, cte_limit,
+                    k_rrf, k_rrf,
+                    k_per_doc
                 )
             )
             results.append(cursor.fetchall())
@@ -559,52 +565,85 @@ def related_chunks_per_doc(
 
 
 # ── Chat history ────────────────────────────────────────────
-def save_chat(user_id, role, content, mode='sec'):
+def save_chat(user_id, role, content, mode='sec', chat_id=None):
+    """chat_id groups messages into one sidebar 'chat section'. Pass the
+    same chat_id for every message in the same conversation thread."""
     with get_db() as cursor:
         cursor.execute(
             """
-            INSERT INTO chat_history (user_id, role, content, mode)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO chat_history (user_id, role, content, mode, chat_id)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (user_id, role, content, mode),
+            (user_id, role, content, mode, chat_id),
         )
 
 
-def load_chat(user_id, mode=None):
+def load_chat(user_id, mode=None, chat_id=None):
+    """Load messages for a user. If chat_id is given, scopes to that single
+    chat section. If only mode is given (no chat_id), returns everything
+    under that mode across all chat sections (legacy/back-compat behavior)."""
+    query = "SELECT role, content FROM chat_history WHERE user_id = %s"
+    params = [user_id]
+    if mode:
+        query += " AND mode = %s"
+        params.append(mode)
+    if chat_id:
+        query += " AND chat_id = %s"
+        params.append(chat_id)
+    query += " ORDER BY id"
+
     with get_db() as cursor:
-        if mode:
-            cursor.execute(
-                """
-                SELECT role, content
-                FROM chat_history
-                WHERE user_id = %s AND mode = %s
-                ORDER BY id
-                """,
-                (user_id, mode),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT role, content
-                FROM chat_history
-                WHERE user_id = %s
-                ORDER BY id
-                """,
-                (user_id,),
-            )
+        cursor.execute(query, params)
         rows = cursor.fetchall()
     return [{"role": "user" if role == "user" else "assistant", "content": content} for role, content in rows]
 
 
-def clear_chat(user_id: str, mode: str = None):
+def clear_chat(user_id: str, mode: str = None, chat_id: str = None):
+    query = "DELETE FROM chat_history WHERE user_id = %s"
+    params = [user_id]
+    if mode:
+        query += " AND mode = %s"
+        params.append(mode)
+    if chat_id:
+        query += " AND chat_id = %s"
+        params.append(chat_id)
+
     with get_db() as cursor:
-        if mode:
-            cursor.execute(
-                "DELETE FROM chat_history WHERE user_id = %s AND mode = %s",
-                (user_id, mode),
-            )
-        else:
-            cursor.execute(
-                "DELETE FROM chat_history WHERE user_id = %s",
-                (user_id,),
-            )
+        cursor.execute(query, params)
+
+
+def list_chats(user_id: str, mode: str = "sec"):
+    """One row per chat_id — powers the sidebar. Title is derived from the
+    first user message in that chat_id; sorted by most recently active."""
+    with get_db() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                chat_id,
+                MIN(created_at) AS started_at,
+                MAX(created_at) AS updated_at,
+                (ARRAY_AGG(content ORDER BY created_at) FILTER (WHERE role = 'user'))[1] AS first_message
+            FROM chat_history
+            WHERE user_id = %s AND mode = %s AND chat_id IS NOT NULL
+            GROUP BY chat_id
+            ORDER BY updated_at DESC
+            """,
+            (user_id, mode),
+        )
+        rows = cursor.fetchall()
+
+    def make_title(text):
+        if not text:
+            return "New chat"
+        text = text.strip().replace("\n", " ")
+        return text[:50] + "…" if len(text) > 50 else text
+
+    return [
+        {
+            "chat_id": str(r[0]),
+            "started_at": str(r[1]),
+            "updated_at": str(r[2]),
+            "title": make_title(r[3]),
+        }
+        for r in rows
+    ]
