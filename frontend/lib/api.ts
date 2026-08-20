@@ -37,6 +37,10 @@ type RequestOptions = {
   isForm?: boolean
 }
 
+// Guards against firing the redirect more than once if several requests
+// 401 around the same time (e.g. sidebar + panel both loading on mount).
+let redirectingToLogin = false
+
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = "GET", body, auth = true, isForm = false } = options
 
@@ -76,6 +80,21 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     } catch {
       // ignore parse errors
     }
+
+    // An authenticated request came back unauthorized — the stored token is
+    // invalid or expired (e.g. backend restarted with a new SECRET_KEY, or
+    // the 24h expiry passed). Clear it and bounce back to the login screen
+    // instead of leaving the app silently broken. Login/register calls
+    // (auth: false) are exempt — a 401 there just means wrong credentials,
+    // not a session problem, and should surface as a normal form error.
+    if (res.status === 401 && auth) {
+      clearToken()
+      if (typeof window !== "undefined" && !redirectingToLogin) {
+        redirectingToLogin = true
+        window.location.href = "/"
+      }
+    }
+
     throw new ApiError(detail, res.status)
   }
 

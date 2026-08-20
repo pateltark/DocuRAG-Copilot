@@ -9,11 +9,28 @@ import { FileSearch, FileText, Landmark } from "lucide-react"
 
 type Mode = "sec" | "doc"
 
+const SIDEBAR_COLLAPSED_KEY = "chatSidebarCollapsed"
+
 export function Workspace() {
   const [mode, setMode] = useState<Mode>("sec")
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+
+  // Restore collapsed state from a previous session.
+  useEffect(() => {
+    const saved = localStorage.getItem(SIDEBAR_COLLAPSED_KEY)
+    if (saved) setSidebarCollapsed(saved === "true")
+  }, [])
+
+  function toggleSidebarCollapsed() {
+    setSidebarCollapsed((prev) => {
+      const next = !prev
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(next))
+      return next
+    })
+  }
 
   // Switching modes means switching chat lists — start fresh each time.
   useEffect(() => {
@@ -72,13 +89,15 @@ export function Workspace() {
         </div>
       </aside>
 
-      {/* Chat sessions list for the current mode */}
+      {/* Chat sessions list for the current mode — collapsible drawer */}
       <ChatSidebar
         mode={mode}
         activeChatId={activeChatId}
         onSelectChat={setActiveChatId}
         onNewChat={() => setActiveChatId(null)}
         refreshKey={sidebarRefreshKey}
+        collapsed={sidebarCollapsed}
+        onToggleCollapsed={toggleSidebarCollapsed}
       />
 
       <main className="flex-1 overflow-hidden">
@@ -114,9 +133,7 @@ function ModeButton({
       onClick={onClick}
       className={
         "flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium transition-colors " +
-        (active
-          ? "bg-primary/10 text-primary"
-          : "text-foreground hover:bg-muted")
+        (active ? "bg-primary/10 text-primary" : "text-foreground hover:bg-muted")
       }
       aria-current={active ? "page" : undefined}
     >
