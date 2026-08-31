@@ -27,44 +27,95 @@ load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# ── Lazy-Loaded Reranker ───────────────────────────────────────────
-_reranker = None
 
-def get_reranker():
-    global _reranker
-    if _reranker is None:
-        from sentence_transformers import CrossEncoder
-        print("⚡ Loading BAAI/bge-reranker-large...")
-        _reranker = CrossEncoder("BAAI/bge-reranker-large")
-    return _reranker
+RELEVANCE_THRESHOLD = 1.45
+DEBUG_RELEVANCE = os.getenv("DEBUG_RELEVANCE") == "1"
+
+TOP_K = 4
 
 
-def rerank_chunks(query: str, chunks: list, top_k: int = 4) -> list:
+def _flatten(chunks):
+    """Flatten a possibly-grouped list of chunk rows into a single list."""
     if not chunks:
         return []
-
-    flat_chunks = []
     if isinstance(chunks, list) and len(chunks) > 0 and isinstance(chunks[0], list):
+        flat = []
         for group in chunks:
-            flat_chunks.extend(group)
-    else:
-        flat_chunks = chunks
+            flat.extend(group)
+        return flat
+    return chunks
 
+
+def select_top_chunks(chunks, top_k: int = TOP_K) -> list:
+    """
+    Replaces the old cross-encoder reranker.
+    Flattens grouped chunks, sorts by vector distance (ascending = most
+    relevant first, since these are L2/cosine distances), and returns
+    the top_k closest chunks.
+
+    NOTE: this is a purely global sort. When `chunks` contains groups
+    from MULTIPLE documents, a global top_k can starve out documents
+    entirely (all top_k slots taken by one document's chunks). Use
+    select_top_chunks_per_group() instead for multi-document retrieval.
+    """
+    flat_chunks = _flatten(chunks)
     if not flat_chunks:
         return []
 
-    pairs = [[query, chunk[0]] for chunk in flat_chunks]
-    reranker = get_reranker()
-    scores = reranker.predict(pairs)
+    try:
+        flat_chunks = sorted(flat_chunks, key=lambda row: row[-1])
+    except (TypeError, IndexError):
+        # If rows don't have a sortable distance field, fall back to
+        # original order rather than failing.
+        pass
 
-    scored_chunks = list(zip(scores, flat_chunks))
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
-
-    return [chunk for score, chunk in scored_chunks[:top_k]]
+    return flat_chunks[:top_k]
 
 
-RELEVANCE_THRESHOLD = 1.0
-DEBUG_RELEVANCE = os.getenv("DEBUG_RELEVANCE") == "1"
+def select_top_chunks_per_group(grouped_chunks, per_group_k: int = 3, overall_cap: int = 16) -> list:
+    """
+    Diversity-aware chunk selection for multi-document retrieval.
+
+    Unlike select_top_chunks() (a pure global sort), this guarantees every
+    group (i.e. every document) contributes up to `per_group_k` of its own
+    best chunks, sorted by distance within that group. This prevents one
+    document's chunks from crowding out every other selected document when
+    answering comparison/cross-document questions.
+
+    `grouped_chunks` is expected to be a list of groups, each group being
+    a list of chunk rows for one document (the shape returned by
+    related_chunks_per_doc). A flat (non-grouped) list is treated as a
+    single group.
+
+    The combined result across all groups is then capped at `overall_cap`
+    (sorted by distance) so very large multi-doc selections still stay
+    within a reasonable size for the LLM context window.
+    """
+    if not grouped_chunks:
+        return []
+
+    if not isinstance(grouped_chunks[0], list):
+        grouped_chunks = [grouped_chunks]
+
+    selected = []
+    for group in grouped_chunks:
+        if not group:
+            continue
+        try:
+            group_sorted = sorted(group, key=lambda row: row[-1])
+        except (TypeError, IndexError):
+            group_sorted = group
+        selected.extend(group_sorted[:per_group_k])
+
+    if not selected:
+        return []
+
+    try:
+        selected = sorted(selected, key=lambda row: row[-1])
+    except (TypeError, IndexError):
+        pass
+
+    return selected[:overall_cap]
 
 
 def format_citations(context_chunks, mode: str = "doc") -> str:
@@ -73,12 +124,7 @@ def format_citations(context_chunks, mode: str = "doc") -> str:
 
     if mode == "sec":
         sec_sources = set()
-        flat_sec_rows = []
-        if isinstance(context_chunks, list) and len(context_chunks) > 0 and isinstance(context_chunks[0], list):
-            for group in context_chunks:
-                flat_sec_rows.extend(group)
-        else:
-            flat_sec_rows = context_chunks
+        flat_sec_rows = _flatten(context_chunks)
 
         for row in flat_sec_rows:
             if len(row) >= 4:
@@ -95,12 +141,7 @@ def format_citations(context_chunks, mode: str = "doc") -> str:
         return ""
 
     doc_pages = defaultdict(set)
-    flat_pdf_rows = []
-    if isinstance(context_chunks, list) and len(context_chunks) > 0 and isinstance(context_chunks[0], list):
-        for group in context_chunks:
-            flat_pdf_rows.extend(group)
-    else:
-        flat_pdf_rows = context_chunks
+    flat_pdf_rows = _flatten(context_chunks)
 
     for row in flat_pdf_rows:
         filename = "Document"
@@ -190,12 +231,7 @@ def generate_answer(
     if not context_chunks:
         return NOT_ENOUGH_INFO
 
-    flat_rows = []
-    if isinstance(context_chunks, list) and len(context_chunks) > 0 and isinstance(context_chunks[0], list):
-        for group in context_chunks:
-            flat_rows.extend(group)
-    else:
-        flat_rows = context_chunks
+    flat_rows = _flatten(context_chunks)
 
     if not flat_rows:
         return NOT_ENOUGH_INFO
@@ -285,12 +321,12 @@ def ask_sec(question: str, user_id: str):
         if not chunks:
             return NOT_ENOUGH_INFO
 
-        reranked_chunks = rerank_chunks(query=search_query, chunks=chunks, top_k=4)
-        if not reranked_chunks:
+        top_chunks = select_top_chunks(chunks, top_k=TOP_K)
+        if not top_chunks:
             return NOT_ENOUGH_INFO
 
-        sec_crnt_ans = generate_answer(search_query, reranked_chunks, user_id, mode="sec")
-        
+        sec_crnt_ans = generate_answer(search_query, top_chunks, user_id, mode="sec")
+
         # 2. Save cache WITH doc_ids
         save_to_cache(mode="sec", doc_ids=doc_ids, question=question, response={"answer": sec_crnt_ans}, ttl=86400)
         return sec_crnt_ans
@@ -349,13 +385,13 @@ def ask_sec(question: str, user_id: str):
     if not sec_chunks:
         return NOT_ENOUGH_INFO
 
-    reranked_chunks = rerank_chunks(query=search_query, chunks=sec_chunks, top_k=4)
-    if not reranked_chunks:
+    top_chunks = select_top_chunks(sec_chunks, top_k=TOP_K)
+    if not top_chunks:
         return NOT_ENOUGH_INFO
 
     set_active_set(user_id, touched_docs)
-    sec_ans = generate_answer(search_query, reranked_chunks, user_id, mode="sec")
-    
+    sec_ans = generate_answer(search_query, top_chunks, user_id, mode="sec")
+
     # Save cache WITH specific doc_ids
     save_to_cache(mode="sec", doc_ids=doc_ids, question=question, response={"answer": sec_ans}, ttl=86400)
     return sec_ans
@@ -367,27 +403,50 @@ def ask_upload(question: str, user_id: str, document_ids: list[str] | None = Non
     if not document_ids:
         return "Please select at least one document to chat with."
 
-    # 1. Check cache WITH selected document_ids
     cached_payload, cache_status = get_cached_response(mode="doc", doc_ids=document_ids, question=question)
     if cached_payload:
         return cached_payload.get("answer", cached_payload) if isinstance(cached_payload, dict) else cached_payload
 
-    # 2. Fetch context chunks from specific documents
+    search_query = question
+    is_multi_doc = len(document_ids) > 1
+
     raw_chunks = related_chunks_per_doc(
         user_id=user_id, question=question, document_ids=document_ids, k_per_doc=10
     )
     raw_chunks = [group for group in raw_chunks if group]
 
+    print(f"[DEBUG] raw_chunks groups: {len(raw_chunks)}, total rows: {sum(len(g) for g in raw_chunks)}")
+    print(f"[DEBUG] best distance: {_best_distance(raw_chunks)}, threshold: {RELEVANCE_THRESHOLD}")
+
+    if not raw_chunks or (not is_multi_doc and not _is_relevant(raw_chunks)):
+        search_query = contextualize_question(question, user_id, mode="doc")
+        print(f"[DEBUG] rewritten query: {search_query}")
+        reworded_chunks = related_chunks_per_doc(
+            user_id=user_id, question=search_query, document_ids=document_ids, k_per_doc=10
+        )
+        reworded_chunks = [group for group in reworded_chunks if group]
+        print(f"[DEBUG] reworded_chunks groups: {len(reworded_chunks)}")
+        if reworded_chunks:
+            raw_chunks = reworded_chunks
+
     if not raw_chunks:
+        print("[DEBUG] EXIT: raw_chunks empty after retry -> NOT_ENOUGH_INFO")
         return NOT_ENOUGH_INFO
 
-    reranked_chunks = rerank_chunks(query=question, chunks=raw_chunks, top_k=4)
-    if not reranked_chunks:
+    if is_multi_doc:
+        top_chunks = select_top_chunks_per_group(raw_chunks, per_group_k=4, overall_cap=20)
+    else:
+        top_chunks = select_top_chunks(raw_chunks, top_k=TOP_K)
+
+    print(f"[DEBUG] top_chunks selected: {len(top_chunks)}")
+
+    if not top_chunks:
+        print("[DEBUG] EXIT: top_chunks empty -> NOT_ENOUGH_INFO")
         return NOT_ENOUGH_INFO
 
-    labels = list({row[2] for row in reranked_chunks if len(row) > 2 and row[2]})
-    ans = generate_answer(question=question, context_chunks=reranked_chunks, user_id=user_id, mode="doc", labels=labels)
-    
-    # 3. Save cache WITH selected document_ids
+    labels = list({row[2] for row in top_chunks if len(row) > 2 and row[2]})
+    ans = generate_answer(question=search_query, context_chunks=top_chunks, user_id=user_id, mode="doc", labels=labels)
+    print(f"[DEBUG] final answer starts with: {ans[:80]}")
+
     save_to_cache(mode="doc", doc_ids=document_ids, question=question, response={"answer": ans}, ttl=86400)
     return ans
