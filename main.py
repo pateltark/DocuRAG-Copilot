@@ -1,6 +1,7 @@
 import os
 import uuid
 import tempfile
+import logging
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -13,11 +14,13 @@ from rag.emb_chunks import create_vectorstore
 from auth import hash_password, verify_password, create_access_token, decode_token
 from rag.db import (
     save_user_info, get_user_by_email, get_user_by_id, save_chat, save_emb,
-    save_doc_info, get_user_documents, list_sec_documents,
-    delete_document, save_chat, load_chat, clear_chat, list_chats
+    save_doc_info, update_document_status, get_user_documents, list_sec_documents,
+    delete_document, load_chat, clear_chat, list_chats
 )
 from agent.session import get_active_doc, get_active_set
+import asyncio
 
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SEC Edgar Research API")
 
@@ -26,16 +29,15 @@ security = HTTPBearer()
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://65.2.146.75:3000",
 ]
-
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 class QueryRequest(BaseModel):
     question: str
@@ -52,9 +54,11 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+# ── Updated DocumentOut Pydantic Model ─────────────────────
 class DocumentOut(BaseModel):
     id: str
     filename: str
+    status: str  # Reflects 'processing', 'ready', or 'failed'
 
 
 MAX_COMPARE_DOCS = 5
@@ -118,6 +122,7 @@ def health():
     return {"status": "ok"}
 
 
+# ── Refactored /upload Endpoint ─────────────────────────────
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...), user=Depends(get_current_user)):
     filename = file.filename or ""
@@ -135,13 +140,31 @@ async def upload_document(file: UploadFile = File(...), user=Depends(get_current
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    try:
-        doc_id = save_doc_info(user["sub"], file.filename)
-        create_vectorstore(tmp_path, user["sub"], document_id=doc_id)
-    finally:
-        os.unlink(tmp_path)
+    # 1. Create entry with 'processing' status
+    doc_id = save_doc_info(user["sub"], file.filename, status="processing")
 
-    return {"message": "Document indexed successfully.", "document_id": doc_id}
+    try:
+        # 2. Run embedding work inside thread pool
+        await asyncio.to_thread(create_vectorstore, tmp_path, user["sub"], document_id=doc_id)
+        
+        # 3. Mark document as 'ready' if processing completes without errors
+        update_document_status(doc_id, "ready")
+
+    except Exception as exc:
+        # 4. Mark document as 'failed' if any step in extraction/embedding throws an exception
+        update_document_status(doc_id, "failed")
+        logger.error(f"Failed embedding pipeline for document {doc_id}: {exc}")
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Document processing failed during embedding creation: {str(exc)}"
+        )
+        
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    return {"message": "Document indexed successfully.", "document_id": doc_id, "status": "ready"}
 
 
 @app.delete("/upload")
@@ -159,7 +182,7 @@ async def chat_with_doc(req: QueryRequest, user=Depends(get_current_user)):
         )
 
     user_id = user["sub"]
-    chat_id = req.chat_id or str(uuid.uuid4())  # new chat section if none passed
+    chat_id = req.chat_id or str(uuid.uuid4())
 
     save_chat(user_id=user_id, role="user", content=req.question, mode="doc", chat_id=chat_id)
 
@@ -177,7 +200,7 @@ async def chat_with_doc(req: QueryRequest, user=Depends(get_current_user)):
 @app.post("/chat/sec")
 async def chat_with_sec(req: QueryRequest, user=Depends(get_current_user)):
     user_id = user["sub"]
-    chat_id = req.chat_id or str(uuid.uuid4())  # new chat section if none passed
+    chat_id = req.chat_id or str(uuid.uuid4())
 
     save_chat(user_id=user_id, role="user", content=req.question, mode="sec", chat_id=chat_id)
     answer = ask_sec(question=req.question, user_id=user_id)

@@ -8,7 +8,7 @@ from psycopg2 import pool
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
-
+from rag.embeddings import get_embedding_model
 import os
 import psycopg2.pool
 from dotenv import load_dotenv
@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 # ── Connection pool ─────────────────────────────────────────
 connection_pool = psycopg2.pool.ThreadedConnectionPool(
@@ -191,6 +191,8 @@ def _run_migrations():
 
 
 _run_migrations()
+
+
 
 
 # ── SEC vectors ─────────────────────────────────────────────
@@ -432,6 +434,7 @@ def save_emb(content, user_id, embedding, source=None, document_id=None, page_nu
 
 
 def related_chunks(user_id: str, question: str, k: int = 4, document_ids: list[str] | None = None, k_rrf: int = 60):
+    model = get_embedding_model()
     query_embedding = json.dumps(model.encode(question).tolist())
     
     doc_filter = "AND document_id = ANY(%s)" if document_ids else ""
@@ -493,7 +496,8 @@ def related_chunks_per_doc(
     document_ids: list[str], 
     k_per_doc: int = 10,
     k_rrf: int = 60
-):
+):  
+    model = get_embedding_model()
     query_embedding = json.dumps(model.encode(question).tolist())
     
     cte_limit = max(30, k_per_doc * 3)

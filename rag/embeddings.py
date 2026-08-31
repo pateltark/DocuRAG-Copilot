@@ -2,6 +2,12 @@
 import os
 from sentence_transformers import SentenceTransformer
 
+
+"""
+    Returns a global single instance of SentenceTransformer.
+    Loads model weights from local container disk into RAM when called for the first time.
+"""
+
 # Disable parallel tokenizer execution to prevent Windows thread deadlocks
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
