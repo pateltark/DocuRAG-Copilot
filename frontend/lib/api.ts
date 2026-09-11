@@ -119,6 +119,9 @@ export type ChatSession = {
 export type UserDocument = {
   id: string
   filename: string
+  // Backend now returns this — used to poll and show per-document
+  // processing state instead of blocking the whole upload button.
+  status: "processing" | "ready" | "failed"
 }
 
 export type ActiveDoc = {
@@ -187,7 +190,7 @@ export function listSecDocuments() {
 export function uploadPdf(file: File) {
   const form = new FormData()
   form.append("file", file)
-  return request<{ message: string; document_id: string }>("/upload", {
+  return request<{ message: string; document_id: string; status: string }>("/upload", {
     method: "POST",
     body: form,
     isForm: true,

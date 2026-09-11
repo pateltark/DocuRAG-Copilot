@@ -27,8 +27,14 @@ load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-
-RELEVANCE_THRESHOLD = 1.45
+# NOTE: every related_*_chunks() query in rag/db.py returns rrf_score as the
+# LAST column, not raw cosine distance. rrf_score = 1/(k_rrf+rank_semantic) +
+# 1/(k_rrf+rank_keyword) is a "HIGHER is better" score, capped at roughly
+# 2/(k_rrf+1) ≈ 0.033 when k_rrf=60. It is NOT a distance in [0, 2], so a
+# threshold of 1.45 never rejects anything. Threshold below is a MINIMUM
+# acceptable rrf_score, not a maximum distance. Tune empirically — start low
+# and raise it if truly irrelevant chunks still get treated as "relevant".
+RELEVANCE_THRESHOLD = 0.01
 DEBUG_RELEVANCE = os.getenv("DEBUG_RELEVANCE") == "1"
 
 TOP_K = 4
@@ -48,10 +54,9 @@ def _flatten(chunks):
 
 def select_top_chunks(chunks, top_k: int = TOP_K) -> list:
     """
-    Replaces the old cross-encoder reranker.
-    Flattens grouped chunks, sorts by vector distance (ascending = most
-    relevant first, since these are L2/cosine distances), and returns
-    the top_k closest chunks.
+    Flattens grouped chunks, sorts by rrf_score DESCENDING (higher score =
+    more relevant — this is a rank-fusion score, not a distance), and
+    returns the top_k best-ranked chunks.
 
     NOTE: this is a purely global sort. When `chunks` contains groups
     from MULTIPLE documents, a global top_k can starve out documents
@@ -63,9 +68,12 @@ def select_top_chunks(chunks, top_k: int = TOP_K) -> list:
         return []
 
     try:
-        flat_chunks = sorted(flat_chunks, key=lambda row: row[-1])
+        # FIX: was ascending (treated rrf_score as a distance). rrf_score is
+        # "higher is better", so the best chunks must sort first with
+        # reverse=True — otherwise the worst-ranked chunks get selected.
+        flat_chunks = sorted(flat_chunks, key=lambda row: row[-1], reverse=True)
     except (TypeError, IndexError):
-        # If rows don't have a sortable distance field, fall back to
+        # If rows don't have a sortable score field, fall back to
         # original order rather than failing.
         pass
 
@@ -78,9 +86,9 @@ def select_top_chunks_per_group(grouped_chunks, per_group_k: int = 3, overall_ca
 
     Unlike select_top_chunks() (a pure global sort), this guarantees every
     group (i.e. every document) contributes up to `per_group_k` of its own
-    best chunks, sorted by distance within that group. This prevents one
-    document's chunks from crowding out every other selected document when
-    answering comparison/cross-document questions.
+    best chunks, sorted by rrf_score within that group (higher = better).
+    This prevents one document's chunks from crowding out every other
+    selected document when answering comparison/cross-document questions.
 
     `grouped_chunks` is expected to be a list of groups, each group being
     a list of chunk rows for one document (the shape returned by
@@ -88,8 +96,8 @@ def select_top_chunks_per_group(grouped_chunks, per_group_k: int = 3, overall_ca
     single group.
 
     The combined result across all groups is then capped at `overall_cap`
-    (sorted by distance) so very large multi-doc selections still stay
-    within a reasonable size for the LLM context window.
+    (sorted by rrf_score, best first) so very large multi-doc selections
+    still stay within a reasonable size for the LLM context window.
     """
     if not grouped_chunks:
         return []
@@ -102,7 +110,8 @@ def select_top_chunks_per_group(grouped_chunks, per_group_k: int = 3, overall_ca
         if not group:
             continue
         try:
-            group_sorted = sorted(group, key=lambda row: row[-1])
+            # FIX: descending — rrf_score is "higher is better".
+            group_sorted = sorted(group, key=lambda row: row[-1], reverse=True)
         except (TypeError, IndexError):
             group_sorted = group
         selected.extend(group_sorted[:per_group_k])
@@ -111,7 +120,8 @@ def select_top_chunks_per_group(grouped_chunks, per_group_k: int = 3, overall_ca
         return []
 
     try:
-        selected = sorted(selected, key=lambda row: row[-1])
+        # FIX: descending here too, for the same reason.
+        selected = sorted(selected, key=lambda row: row[-1], reverse=True)
     except (TypeError, IndexError):
         pass
 
@@ -194,9 +204,10 @@ Standalone Search Query:"""
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": rewrite_prompt}],
-            temperature=0.0
+            temperature=0.0,
+            timeout=30,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
@@ -204,19 +215,24 @@ Standalone Search Query:"""
         return question
 
 
-def _best_distance(chunks):
+def _best_score(chunks):
+    """Highest rrf_score across all candidate chunks. Renamed from
+    _best_distance — this is a rank-fusion score (higher = more relevant),
+    not a distance, so we take max(), not min()."""
     if not chunks:
-        return float("inf")
+        return 0.0
     if isinstance(chunks[0], list):
-        distances = [row[-1] for group in chunks for row in group]
+        scores = [row[-1] for group in chunks for row in group]
     else:
-        distances = [row[-1] for row in chunks]
-    return min(distances) if distances else float("inf")
+        scores = [row[-1] for row in chunks]
+    return max(scores) if scores else 0.0
 
 
 def _is_relevant(chunks, threshold: float = RELEVANCE_THRESHOLD) -> bool:
-    distance = _best_distance(chunks)
-    return distance <= threshold
+    """FIX: score must be >= threshold now (was: distance <= threshold,
+    which is backwards for an rrf_score and was always True)."""
+    score = _best_score(chunks)
+    return score >= threshold
 
 
 def generate_answer(
@@ -279,6 +295,7 @@ def generate_answer(
             ],
             temperature=0.1,
             max_tokens=1024,
+            timeout=30,
         )
         answer_text = response.choices[0].message.content.strip()
     except Exception as e:
@@ -415,22 +432,29 @@ def ask_upload(question: str, user_id: str, document_ids: list[str] | None = Non
     )
     raw_chunks = [group for group in raw_chunks if group]
 
-    print(f"[DEBUG] raw_chunks groups: {len(raw_chunks)}, total rows: {sum(len(g) for g in raw_chunks)}")
-    print(f"[DEBUG] best distance: {_best_distance(raw_chunks)}, threshold: {RELEVANCE_THRESHOLD}")
+    if DEBUG_RELEVANCE:
+        print(f"[DEBUG] raw_chunks groups: {len(raw_chunks)}, total rows: {sum(len(g) for g in raw_chunks)}")
+        print(f"[DEBUG] best rrf_score: {_best_score(raw_chunks)}, threshold: {RELEVANCE_THRESHOLD}")
+        for group in raw_chunks:
+            for row in sorted(group, key=lambda r: r[-1], reverse=True)[:3]:
+                print(f"[DEBUG CONTENT] score={row[-1]:.4f} {row[0][:200]!r}")
 
     if not raw_chunks or (not is_multi_doc and not _is_relevant(raw_chunks)):
         search_query = contextualize_question(question, user_id, mode="doc")
-        print(f"[DEBUG] rewritten query: {search_query}")
+        if DEBUG_RELEVANCE:
+            print(f"[DEBUG] rewritten query: {search_query}")
         reworded_chunks = related_chunks_per_doc(
             user_id=user_id, question=search_query, document_ids=document_ids, k_per_doc=10
         )
         reworded_chunks = [group for group in reworded_chunks if group]
-        print(f"[DEBUG] reworded_chunks groups: {len(reworded_chunks)}")
+        if DEBUG_RELEVANCE:
+            print(f"[DEBUG] reworded_chunks groups: {len(reworded_chunks)}")
         if reworded_chunks:
             raw_chunks = reworded_chunks
 
     if not raw_chunks:
-        print("[DEBUG] EXIT: raw_chunks empty after retry -> NOT_ENOUGH_INFO")
+        if DEBUG_RELEVANCE:
+            print("[DEBUG] EXIT: raw_chunks empty after retry -> NOT_ENOUGH_INFO")
         return NOT_ENOUGH_INFO
 
     if is_multi_doc:
@@ -438,15 +462,18 @@ def ask_upload(question: str, user_id: str, document_ids: list[str] | None = Non
     else:
         top_chunks = select_top_chunks(raw_chunks, top_k=TOP_K)
 
-    print(f"[DEBUG] top_chunks selected: {len(top_chunks)}")
+    if DEBUG_RELEVANCE:
+        print(f"[DEBUG] top_chunks selected: {len(top_chunks)}")
 
     if not top_chunks:
-        print("[DEBUG] EXIT: top_chunks empty -> NOT_ENOUGH_INFO")
+        if DEBUG_RELEVANCE:
+            print("[DEBUG] EXIT: top_chunks empty -> NOT_ENOUGH_INFO")
         return NOT_ENOUGH_INFO
 
     labels = list({row[2] for row in top_chunks if len(row) > 2 and row[2]})
     ans = generate_answer(question=search_query, context_chunks=top_chunks, user_id=user_id, mode="doc", labels=labels)
-    print(f"[DEBUG] final answer starts with: {ans[:80]}")
+    if DEBUG_RELEVANCE:
+        print(f"[DEBUG] final answer starts with: {ans[:80]}")
 
     save_to_cache(mode="doc", doc_ids=document_ids, question=question, response={"answer": ans}, ttl=86400)
     return ans

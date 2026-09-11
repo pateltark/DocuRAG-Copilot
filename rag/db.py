@@ -3,21 +3,14 @@ import json
 import uuid
 from contextlib import contextmanager
 
-import psycopg2
-from psycopg2 import pool
-from sentence_transformers import SentenceTransformer
+import psycopg2.pool
 from dotenv import load_dotenv
 
 from rag.embeddings import get_embedding_model
-import os
-import psycopg2.pool
-from dotenv import load_dotenv
 
 # Load variables from .env file into os.environ
 load_dotenv()
 
-
-# model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 # ── Connection pool ─────────────────────────────────────────
 connection_pool = psycopg2.pool.ThreadedConnectionPool(
@@ -193,8 +186,6 @@ def _run_migrations():
 _run_migrations()
 
 
-
-
 # ── SEC vectors ─────────────────────────────────────────────
 def save_sec_vector(document_id: int, ticker: str, form_type: str, filename: str,
                      chunk_index: int, content: str, embedding):
@@ -211,8 +202,12 @@ def save_sec_vector(document_id: int, ticker: str, form_type: str, filename: str
 
 
 def related_sec_chunks(document_id: int, question: str, k: int = 5, k_rrf: int = 60):
+    # FIX: was referencing an undefined module-level `model` (only ever
+    # commented out at the top of this file) — every call threw
+    # NameError. Load it the same way related_chunks()/related_chunks_per_doc() do.
+    model = get_embedding_model()
     query_embedding = json.dumps(model.encode(question).tolist())
-    
+
     sql = """
     WITH semantic_search AS (
         SELECT 

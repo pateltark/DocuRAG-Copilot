@@ -10,7 +10,7 @@ import {
   uploadPdf, // Can be renamed in lib/api later if desired
   type UserDocument,
 } from "@/lib/api"
-import { FileText, Loader2, Trash2, Upload } from "lucide-react"
+import { FileText, Loader2, Trash2, Upload, AlertCircle } from "lucide-react"
 
 const MAX_COMPARE_DOCS = 5
 
@@ -41,6 +41,11 @@ export function DocumentManager({
 }) {
   const { data, isLoading, mutate } = useSWR<UserDocument[]>("documents", listDocuments, {
     revalidateOnFocus: false,
+    // Keep polling every 3s as long as at least one document is still
+    // being processed server-side (Docling parsing + embeddings run in
+    // the background now, so the list needs to catch up on its own).
+    refreshInterval: (latestData) =>
+      latestData?.some((d) => d.status === "processing") ? 3000 : 0,
   })
   const documents = data ?? []
 
@@ -61,6 +66,9 @@ export function DocumentManager({
     setError(null)
     setUploading(true)
     try {
+      // uploadPdf now resolves as soon as the backend accepts the file
+      // (status: "processing") rather than waiting for embeddings to
+      // finish, so this only shows "Uploading..." briefly.
       await uploadPdf(file)
       await mutate()
     } catch (err) {
@@ -147,6 +155,8 @@ export function DocumentManager({
         ) : (
           documents.map((doc) => {
             const selected = selectedIds.includes(doc.id)
+            const isProcessing = doc.status === "processing"
+            const isFailed = doc.status === "failed"
             return (
               <div
                 key={doc.id}
@@ -159,13 +169,39 @@ export function DocumentManager({
                   type="checkbox"
                   checked={selected}
                   onChange={() => toggle(doc.id)}
-                  className="size-3.5 shrink-0 accent-primary"
+                  disabled={isProcessing || isFailed}
+                  className="size-3.5 shrink-0 accent-primary disabled:opacity-40"
                   aria-label={`Select ${doc.filename} for comparison`}
                 />
                 <FileText className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-                <span className="flex-1 truncate" title={doc.filename}>
+                <span
+                  className={
+                    "flex-1 truncate " + (isProcessing || isFailed ? "text-muted-foreground" : "")
+                  }
+                  title={doc.filename}
+                >
                   {doc.filename}
                 </span>
+
+                {isProcessing && (
+                  <span
+                    className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground"
+                    title="Still processing this document"
+                  >
+                    <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                    Processing…
+                  </span>
+                )}
+                {isFailed && (
+                  <span
+                    className="flex shrink-0 items-center gap-1 text-xs text-destructive"
+                    title="Processing failed — try deleting and re-uploading"
+                  >
+                    <AlertCircle className="size-3.5" aria-hidden="true" />
+                    Failed
+                  </span>
+                )}
+
                 <button
                   type="button"
                   onClick={() => void onDelete(doc.id)}

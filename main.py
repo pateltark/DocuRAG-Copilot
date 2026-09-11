@@ -8,7 +8,7 @@ from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from jose import JWTError
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
+from fastapi import BackgroundTasks
 from agent.llm_agent import ask_upload, ask_sec
 from rag.emb_chunks import create_vectorstore
 from auth import hash_password, verify_password, create_access_token, decode_token
@@ -85,6 +85,18 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
 
+def _process_document(tmp_path: str, user_id: str, doc_id: str):
+    try:
+        create_vectorstore(tmp_path, user_id, document_id=doc_id)
+        update_document_status(doc_id, "ready")
+    except Exception as exc:
+        update_document_status(doc_id, "failed")
+        logger.error(f"Failed embedding pipeline for document {doc_id}: {exc}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 @app.get("/documents", response_model=list[DocumentOut])
 def list_documents(user=Depends(get_current_user)):
     return get_user_documents(user["sub"])
@@ -123,48 +135,73 @@ def health():
 
 
 # ── Refactored /upload Endpoint ─────────────────────────────
+
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...), user=Depends(get_current_user)):
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
     filename = file.filename or ""
     ext = filename.split(".")[-1].lower() if "." in filename else ""
-
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format '.{ext}'. Allowed formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-        )
+        raise HTTPException(status_code=400, detail=f"Unsupported file format '.{ext}'.")
 
     file_suffix = f".{ext}" if ext else ""
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
-    # 1. Create entry with 'processing' status
     doc_id = save_doc_info(user["sub"], file.filename, status="processing")
 
-    try:
-        # 2. Run embedding work inside thread pool
-        await asyncio.to_thread(create_vectorstore, tmp_path, user["sub"], document_id=doc_id)
-        
-        # 3. Mark document as 'ready' if processing completes without errors
-        update_document_status(doc_id, "ready")
+    # Kick off processing in the background, return right away
+    background_tasks.add_task(_process_document, tmp_path, user["sub"], doc_id)
 
-    except Exception as exc:
-        # 4. Mark document as 'failed' if any step in extraction/embedding throws an exception
-        update_document_status(doc_id, "failed")
-        logger.error(f"Failed embedding pipeline for document {doc_id}: {exc}")
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"Document processing failed during embedding creation: {str(exc)}"
-        )
-        
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+    return {"message": "Upload received, processing.", "document_id": doc_id, "status": "processing"}
 
-    return {"message": "Document indexed successfully.", "document_id": doc_id, "status": "ready"}
+    
+# @app.post("/upload")
+# async def upload_document(file: UploadFile = File(...), user=Depends(get_current_user)):
+#     filename = file.filename or ""
+#     ext = filename.split(".")[-1].lower() if "." in filename else ""
+
+#     if ext not in ALLOWED_EXTENSIONS:
+#         raise HTTPException(
+#             status_code=400,
+#             detail=f"Unsupported file format '.{ext}'. Allowed formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+#         )
+
+#     file_suffix = f".{ext}" if ext else ""
+
+#     with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
+#         tmp.write(await file.read())
+#         tmp_path = tmp.name
+
+#     # 1. Create entry with 'processing' status
+#     doc_id = save_doc_info(user["sub"], file.filename, status="processing")
+
+#     try:
+#         # 2. Run embedding work inside thread pool
+#         await asyncio.to_thread(create_vectorstore, tmp_path, user["sub"], document_id=doc_id)
+        
+#         # 3. Mark document as 'ready' if processing completes without errors
+#         update_document_status(doc_id, "ready")
+
+#     except Exception as exc:
+#         # 4. Mark document as 'failed' if any step in extraction/embedding throws an exception
+#         update_document_status(doc_id, "failed")
+#         logger.error(f"Failed embedding pipeline for document {doc_id}: {exc}")
+        
+#         raise HTTPException(
+#             status_code=500,
+#             detail=f"Document processing failed during embedding creation: {str(exc)}"
+#         )
+        
+#     finally:
+#         if os.path.exists(tmp_path):
+#             os.unlink(tmp_path)
+
+#     return {"message": "Document indexed successfully.", "document_id": doc_id, "status": "ready"}
 
 
 @app.delete("/upload")
