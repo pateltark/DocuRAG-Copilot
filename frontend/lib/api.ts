@@ -76,6 +76,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       const data = await res.json()
       if (data?.detail) {
         detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)
+      } else if (data?.message) {
+        detail = data.message
       }
     } catch {
       // ignore parse errors
@@ -188,6 +190,10 @@ export function listSecDocuments() {
 }
 
 export function uploadPdf(file: File) {
+  const MAX_SIZE = 25 * 1024 * 1024
+  if (file.size > MAX_SIZE) {
+    return Promise.reject(new ApiError(`File exceeds the ${MAX_SIZE / (1024 * 1024)}MB upload limit.`, 413))
+  }
   const form = new FormData()
   form.append("file", file)
   return request<{ message: string; document_id: string; status: string }>("/upload", {

@@ -20,6 +20,14 @@ from rag.db import (
 from agent.session import get_active_doc, get_active_set
 import asyncio
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SEC Edgar Research API")
@@ -62,11 +70,65 @@ class DocumentOut(BaseModel):
 
 
 MAX_COMPARE_DOCS = 5
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
 ALLOWED_EXTENSIONS = {
     "pdf", "docx", "doc", "pptx", "xlsx", 
     "csv", "txt", "md", "html", "png", "jpg", "jpeg"
 }
+
+
+
+# ── Rate limiter setup ──────────────────────────────────────
+# Reuses the same REDIS_HOST/PORT/PASSWORD/DB env vars as rag/redis_cache.py
+def _build_redis_url() -> str:
+    host = os.getenv("REDIS_HOST", "localhost")
+    port = os.getenv("REDIS_PORT", "6379")
+    password = os.getenv("REDIS_PASSWORD", "")
+    db = os.getenv("REDIS_DB", "0")
+    auth = f":{password}@" if password else ""
+    return f"redis://{auth}{host}:{port}/{db}"
+
+
+def user_or_ip_key(request: Request) -> str:
+    """Rate-limit by authenticated user id when possible, else by IP."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            payload = decode_token(auth_header.removeprefix("Bearer "))
+            return f"user:{payload['sub']}"
+        except JWTError:
+            pass
+    return f"ip:{get_remote_address(request)}"
+
+
+limiter = Limiter(key_func=user_or_ip_key, storage_uri=_build_redis_url())
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+
+RATE_LIMIT_MESSAGES = {
+    "/auth/login": "Too many login attempts. Please wait a minute and try again.",
+    "/auth/register": "Too many signup attempts. Please wait a minute and try again.",
+    "/upload": "Too many uploads. Please wait a minute before uploading again.",
+    "/chat/doc": "You're sending messages too fast. Please slow down.",
+    "/chat/sec": "You're sending messages too fast. Please slow down.",
+}
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    message = RATE_LIMIT_MESSAGES.get(
+        request.url.path,
+        "You're doing that too often. Please wait a moment and try again."
+    )
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "rate_limited",
+            "message": message,
+        },
+    )
 
 
 @app.get("/")
@@ -103,7 +165,8 @@ def list_documents(user=Depends(get_current_user)):
 
 
 @app.post("/auth/register")
-def register(body: RegisterRequest):
+@limiter.limit("5/minute")
+def register(request: Request, body: RegisterRequest):
     existing = get_user_by_email(body.email)
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered.")
@@ -113,7 +176,8 @@ def register(body: RegisterRequest):
 
 
 @app.post("/auth/login")
-def login(body: LoginRequest):
+@limiter.limit("5/minute")
+def login(request: Request, body: LoginRequest):
     user = get_user_by_email(body.email)
     if not user or not verify_password(body.password, user["pass_word"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
@@ -137,7 +201,9 @@ def health():
 # ── Refactored /upload Endpoint ─────────────────────────────
 
 @app.post("/upload")
+@limiter.limit("5/minute")
 async def upload_document(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user=Depends(get_current_user),
@@ -148,13 +214,26 @@ async def upload_document(
         raise HTTPException(status_code=400, detail=f"Unsupported file format '.{ext}'.")
 
     file_suffix = f".{ext}" if ext else ""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    total = 0
+    tmp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp:
+            tmp_path = tmp.name
+            while chunk := await file.read(1024 * 1024):  # read in 1MB chunks
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit."
+                    )
+                tmp.write(chunk)
+    except HTTPException:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
     doc_id = save_doc_info(user["sub"], file.filename, status="processing")
-
-    # Kick off processing in the background, return right away
     background_tasks.add_task(_process_document, tmp_path, user["sub"], doc_id)
 
     return {"message": "Upload received, processing.", "document_id": doc_id, "status": "processing"}
@@ -211,7 +290,8 @@ def clear_pdf(user=Depends(get_current_user)):
 
 
 @app.post("/chat/doc")
-async def chat_with_doc(req: QueryRequest, user=Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def chat_with_doc(request: Request, req: QueryRequest, user=Depends(get_current_user)):
     if req.document_ids and len(req.document_ids) > MAX_COMPARE_DOCS:
         raise HTTPException(
             status_code=400,
@@ -235,7 +315,8 @@ async def chat_with_doc(req: QueryRequest, user=Depends(get_current_user)):
 
 
 @app.post("/chat/sec")
-async def chat_with_sec(req: QueryRequest, user=Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def chat_with_sec(request: Request, req: QueryRequest, user=Depends(get_current_user)):
     user_id = user["sub"]
     chat_id = req.chat_id or str(uuid.uuid4())
 
