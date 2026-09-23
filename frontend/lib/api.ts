@@ -84,16 +84,17 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     }
 
     // An authenticated request came back unauthorized — the stored token is
-    // invalid or expired (e.g. backend restarted with a new SECRET_KEY, or
-    // the 24h expiry passed). Clear it and bounce back to the login screen
-    // instead of leaving the app silently broken. Login/register calls
-    // (auth: false) are exempt — a 401 there just means wrong credentials,
-    // not a session problem, and should surface as a normal form error.
+    // invalid or expired. Clear it and bounce back to the login screen without
+    // throwing an unhandled rejection that pops up in Next.js.
     if (res.status === 401 && auth) {
       clearToken()
-      if (typeof window !== "undefined" && !redirectingToLogin) {
-        redirectingToLogin = true
-        window.location.href = "/"
+      if (typeof window !== "undefined") {
+        if (!redirectingToLogin) {
+          redirectingToLogin = true
+          window.location.href = "/"
+        }
+        // Return a pending promise to halt downstream execution while redirecting
+        return new Promise<T>(() => {})
       }
     }
 

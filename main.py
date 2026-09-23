@@ -87,7 +87,8 @@ def _build_redis_url() -> str:
     password = os.getenv("REDIS_PASSWORD", "")
     db = os.getenv("REDIS_DB", "0")
     auth = f":{password}@" if password else ""
-    return f"redis://{auth}{host}:{port}/{db}"
+    # Added protocol=2 to force RESP2 compatibility for older Redis servers
+    return f"redis://{auth}{host}:{port}/{db}?protocol=2"
 
 
 def user_or_ip_key(request: Request) -> str:
