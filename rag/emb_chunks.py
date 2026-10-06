@@ -1,16 +1,11 @@
 import os
 import gc
-import json
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from groq import Groq
 
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.datamodel.base_models import InputFormat
-
+from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
 from langchain_core.documents import Document
 
 from rag.embeddings import get_embedding_model
@@ -19,59 +14,14 @@ from rag.db import (
     update_document_status,
 )
 
-from pypdf import PdfReader, PdfWriter
-import tempfile
-
 
 load_dotenv()
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 model = get_embedding_model()
 
-# Restrict background execution to 1 file at a time to prevent RAM multiplication
+# Restrict background execution to 1 file at a time to keep RAM predictable
 _ingest_executor = ThreadPoolExecutor(max_workers=1)
-
-# ==============================================================================
-# 🚀 MEMORY OPTIMIZED DOCLING CONFIGURATION
-# ==============================================================================
-pipeline_options = PdfPipelineOptions()
-pipeline_options.do_ocr = False
-pipeline_options.do_table_structure = False
-pipeline_options.generate_page_images = False   # ADD: stops page rasterization if this flag exists in your version
-pipeline_options.images_scale = 1.0   # Disables table AI vision model (saves ~30% RAM & eliminates std::bad_alloc)
-
-doc_converter = DocumentConverter(
-    format_options={
-        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-    }
-)
-
-
-# ==============================================================================
-
-
-def _split_pdf_into_chunks(pdf_path: str, pages_per_chunk: int = 2):
-    """Splits a PDF into smaller temp PDFs. Returns list of
-    (chunk_path, start_page_offset) where start_page_offset is the
-    0-based index of the first page in this chunk, relative to the
-    original document — used to correct page numbers later."""
-    reader = PdfReader(pdf_path)
-    total_pages = len(reader.pages)
-    chunks = []
-
-    for start in range(0, total_pages, pages_per_chunk):
-        end = min(start + pages_per_chunk, total_pages)
-        writer = PdfWriter()
-        for i in range(start, end):
-            writer.add_page(reader.pages[i])
-
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        with open(tmp.name, "wb") as f:
-            writer.write(f)
-
-        chunks.append((tmp.name, start))  # start = 0-based offset
-
-    return chunks
 
 
 def submit_ingest_job(pdf_path: str, user_id: str, document_id: str, filename: str):
@@ -185,10 +135,9 @@ def create_vectorstore(
     user_id: str,
     source: str = None,
     document_id: str = None,
-    pages_per_chunk: int = 2,
 ):
-    """Parses documents with Docling in page-batches to bound native
-    memory use, while preserving correct page numbers."""
+    """Extracts text page by page with pypdf, chunks it, embeds it,
+    and saves it with the correct page number."""
 
     clean_user_id = clean_string(user_id)
     clean_source = clean_string(source or pdf_path)
@@ -199,91 +148,46 @@ def create_vectorstore(
         chunk_overlap=60,
     )
 
-    chunk_paths = _split_pdf_into_chunks(pdf_path, pages_per_chunk=pages_per_chunk)
+    reader = PdfReader(pdf_path)
     any_content_found = False
 
-    try:
-        for chunk_path, page_offset in chunk_paths:
-            try:
-                result = doc_converter.convert(chunk_path)
+    for page_index, page in enumerate(reader.pages):
+        try:
+            page_text = clean_string(page.extract_text() or "")
+        except Exception as e:
+            print(f"[ingest] page {page_index + 1} extract failed: {e}")
+            continue
 
-                pages_map = {}  # local page_num (within chunk) -> list of text snippets
+        if not page_text or len(page_text.strip()) < 10:
+            continue
 
-                for item, _ in result.document.iterate_items():
-                    local_page_num = None
-                    if getattr(item, "prov", None) and len(item.prov) > 0:
-                        local_page_num = item.prov[0].page_no
+        real_page_num = page_index + 1  # 1-based page number
 
-                    snippet = ""
-                    if hasattr(item, "export_to_markdown"):
-                        try:
-                            snippet = item.export_to_markdown(doc=result.document)
-                        except Exception:
-                            snippet = getattr(item, "text", "")
-                    elif hasattr(item, "text") and item.text:
-                        snippet = item.text.strip()
+        doc = Document(page_content=page_text, metadata={"source": clean_source})
+        chunks = splitter.split_documents([doc])
 
-                    if snippet and snippet.strip():
-                        if local_page_num not in pages_map:
-                            pages_map[local_page_num] = []
-                        pages_map[local_page_num].append(snippet.strip())
+        texts = [clean_string(c.page_content) for c in chunks]
+        texts = [t for t in texts if t and t.strip()]
+        if not texts:
+            continue
 
-                # Fallback if this chunk yielded nothing structurally
-                if not pages_map:
-                    full_md = clean_string(result.document.export_to_markdown())
-                    if full_md and len(full_md.strip()) >= 50:
-                        pages_map = {1: [full_md]}  # local page 1 = only page in a degenerate case
+        # Batch-encode all chunks of this page in one call
+        embeddings = model.encode(texts, batch_size=16)
 
-                for local_page_num, snippets in pages_map.items():
-                    page_text = clean_string("\n\n".join(snippets))
-                    if not page_text or len(page_text.strip()) < 10:
-                        continue
+        for text, emb in zip(texts, embeddings):
+            save_emb(
+                content=text,
+                user_id=clean_user_id,
+                embedding=emb.tolist(),
+                source=clean_source,
+                document_id=clean_doc_id,
+                page_number=real_page_num,
+            )
+            any_content_found = True
 
-                    # Correct page number: local_page_num is 1-based within
-                    # the chunk; page_offset is 0-based start of chunk in
-                    # the original doc. real_page = offset + local_page_num.
-                    real_page_num = (
-                        page_offset + local_page_num
-                        if local_page_num is not None
-                        else None
-                    )
+    if not any_content_found:
+        raise ValueError(
+            f"No extractable text in {pdf_path}. It may be a scanned PDF (image-only)."
+        )
 
-                    doc = Document(
-                        page_content=page_text,
-                        metadata={"source": clean_source}
-                    )
-                    chunks = splitter.split_documents([doc])
-
-                    for chunk in chunks:
-                        clean_content = clean_string(chunk.page_content)
-                        if not clean_content or not clean_content.strip():
-                            continue
-
-                        emb = model.encode(clean_content).tolist()
-
-                        save_emb(
-                            content=clean_content,
-                            user_id=clean_user_id,
-                            embedding=emb,
-                            source=clean_source,
-                            document_id=clean_doc_id,
-                            page_number=real_page_num,
-                        )
-                        any_content_found = True
-
-                # Free this chunk's Docling result before moving to the next
-                del result
-                gc.collect()
-
-            finally:
-                # Always remove the temp chunk file, even on failure
-                if os.path.exists(chunk_path):
-                    os.unlink(chunk_path)
-
-        if not any_content_found:
-            raise ValueError(f"Docling extracted no usable content from {pdf_path}")
-
-        return True
-
-    finally:
-        gc.collect()
+    return True
