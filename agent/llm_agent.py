@@ -4,6 +4,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import json
 import os
+import re
 from collections import defaultdict
 from dotenv import load_dotenv
 from groq import Groq
@@ -35,9 +36,31 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 # acceptable rrf_score, not a maximum distance. Tune empirically — start low
 # and raise it if truly irrelevant chunks still get treated as "relevant".
 RELEVANCE_THRESHOLD = 0.01
+
+# Set DEBUG_RELEVANCE=1 in your .env (or in the shell) to print retrieval info.
 DEBUG_RELEVANCE = os.getenv("DEBUG_RELEVANCE") == "1"
 
 TOP_K = 4
+
+
+# ── Answer cleaning ─────────────────────────────────────────
+# The LLM sometimes imitates citation styles like 【Source 1†L1-L2】 or
+# [Source 1]. Sources are appended by format_citations(), so strip these.
+_CITATION_FULLWIDTH_RE = re.compile(r"\s*【[^】]*】")
+_CITATION_BRACKET_RE = re.compile(r"\s*\[Source[^\]]*\]", re.IGNORECASE)
+
+
+def clean_answer(text: str) -> str:
+    """Remove model-generated citation markers and make sure the answer
+    ends with proper punctuation."""
+    if not text:
+        return text
+    text = _CITATION_FULLWIDTH_RE.sub("", text)
+    text = _CITATION_BRACKET_RE.sub("", text)
+    text = text.strip()
+    if text and (text[-1].isalnum() or text[-1] in ")\"'"):
+        text += "."
+    return text
 
 
 def _flatten(chunks):
@@ -68,9 +91,6 @@ def select_top_chunks(chunks, top_k: int = TOP_K) -> list:
         return []
 
     try:
-        # FIX: was ascending (treated rrf_score as a distance). rrf_score is
-        # "higher is better", so the best chunks must sort first with
-        # reverse=True — otherwise the worst-ranked chunks get selected.
         flat_chunks = sorted(flat_chunks, key=lambda row: row[-1], reverse=True)
     except (TypeError, IndexError):
         # If rows don't have a sortable score field, fall back to
@@ -110,7 +130,6 @@ def select_top_chunks_per_group(grouped_chunks, per_group_k: int = 3, overall_ca
         if not group:
             continue
         try:
-            # FIX: descending — rrf_score is "higher is better".
             group_sorted = sorted(group, key=lambda row: row[-1], reverse=True)
         except (TypeError, IndexError):
             group_sorted = group
@@ -120,7 +139,6 @@ def select_top_chunks_per_group(grouped_chunks, per_group_k: int = 3, overall_ca
         return []
 
     try:
-        # FIX: descending here too, for the same reason.
         selected = sorted(selected, key=lambda row: row[-1], reverse=True)
     except (TypeError, IndexError):
         pass
@@ -229,10 +247,33 @@ def _best_score(chunks):
 
 
 def _is_relevant(chunks, threshold: float = RELEVANCE_THRESHOLD) -> bool:
-    """FIX: score must be >= threshold now (was: distance <= threshold,
-    which is backwards for an rrf_score and was always True)."""
+    """Score must be >= threshold (rrf_score is higher-is-better)."""
     score = _best_score(chunks)
     return score >= threshold
+
+
+def _debug_print_chunks(label: str, question: str, rows, mode: str = "doc"):
+    """Print the chunks that will actually be sent to the LLM.
+    Only active when DEBUG_RELEVANCE=1."""
+    if not DEBUG_RELEVANCE:
+        return
+    print(f"\n{'=' * 70}", flush=True)
+    print(f"{label} | Q: {question}", flush=True)
+    print(f"SELECTED {len(rows)} chunks", flush=True)
+    print("=" * 70, flush=True)
+    for i, row in enumerate(rows, 1):
+        score = row[-1]
+        if mode == "sec":
+            where = f"{row[1]} {row[2]} {row[3]}" if len(row) >= 4 else "sec"
+        elif len(row) >= 5:
+            where = f"{row[2]} | page={row[3]}"
+        elif len(row) == 4:
+            where = f"{row[1]} | page={row[2]}"
+        else:
+            where = "doc"
+        print(f"[{i}] score={score:.4f} | {where}", flush=True)
+        print(row[0][:500].replace("\n", " "), flush=True)
+        print("-" * 70, flush=True)
 
 
 def generate_answer(
@@ -255,11 +296,13 @@ def generate_answer(
     context_blocks = []
     for idx, row in enumerate(flat_rows, start=1):
         content = row[0]
+        # Header is labelled "Excerpt" (not "Source") so the model is less
+        # tempted to imitate it as an inline citation style.
         if mode == "sec":
             ticker = row[1] if len(row) > 1 and row[1] else "SEC"
             form_type = row[2] if len(row) > 2 and row[2] else "Filing"
             filename = row[3] if len(row) > 3 and row[3] else ""
-            header = f"[Source {idx}: {ticker} {form_type} - {filename}]"
+            header = f"[Excerpt {idx}: {ticker} {form_type} - {filename}]"
         else:
             if len(row) == 4:
                 fname = row[1] or "Document"
@@ -270,7 +313,7 @@ def generate_answer(
             else:
                 fname = "Document"
                 pnum = ""
-            header = f"[Source {idx}: {fname}{pnum}]"
+            header = f"[Excerpt {idx}: {fname}{pnum}]"
 
         context_blocks.append(f"{header}\n{content}")
 
@@ -283,7 +326,9 @@ def generate_answer(
         "1. Base your answer ONLY on the provided context.\n"
         "2. If the context does not contain enough information, state EXACTLY:\n"
         f"   '{NOT_ENOUGH_INFO}'\n"
-        "3. Do NOT make up citations; sources will be automatically appended."
+        "3. Do NOT include citation markers, source tags, or bracketed references "
+        "(such as 【Source 1】 or [Source 1]) in your answer. Write plain sentences "
+        "only; sources are appended automatically by the application."
     )
 
     try:
@@ -297,7 +342,8 @@ def generate_answer(
             max_tokens=1024,
             timeout=30,
         )
-        answer_text = response.choices[0].message.content.strip()
+        # Strip model-generated citation markers before anything is cached/saved.
+        answer_text = clean_answer(response.choices[0].message.content)
     except Exception as e:
         print(f"[generate_answer Error]: {e}")
         return "An error occurred while generating the response."
@@ -322,7 +368,7 @@ def ask_sec(question: str, user_id: str):
             return "There is no active SEC document. Please ask for a filing first (e.g., 'Show Tesla's latest 10-K')."
 
         doc_id = active_doc["document_id"]
-        doc_ids = [doc_id]  # 👈 Dynamic doc_id scope
+        doc_ids = [doc_id]  # Dynamic doc_id scope
 
         # 1. Check cache WITH doc_ids
         cached_payload, cache_status = get_cached_response(mode="sec", doc_ids=doc_ids, question=question)
@@ -341,6 +387,8 @@ def ask_sec(question: str, user_id: str):
         top_chunks = select_top_chunks(chunks, top_k=TOP_K)
         if not top_chunks:
             return NOT_ENOUGH_INFO
+
+        _debug_print_chunks("ask_sec/CURRENT_DOC", search_query, top_chunks, mode="sec")
 
         sec_crnt_ans = generate_answer(search_query, top_chunks, user_id, mode="sec")
 
@@ -406,6 +454,8 @@ def ask_sec(question: str, user_id: str):
     if not top_chunks:
         return NOT_ENOUGH_INFO
 
+    _debug_print_chunks("ask_sec/FETCH", search_query, top_chunks, mode="sec")
+
     set_active_set(user_id, touched_docs)
     sec_ans = generate_answer(search_query, top_chunks, user_id, mode="sec")
 
@@ -422,6 +472,8 @@ def ask_upload(question: str, user_id: str, document_ids: list[str] | None = Non
 
     cached_payload, cache_status = get_cached_response(mode="doc", doc_ids=document_ids, question=question)
     if cached_payload:
+        if DEBUG_RELEVANCE:
+            print(f"[DEBUG] CACHE HIT ({cache_status}) -> retrieval skipped", flush=True)
         return cached_payload.get("answer", cached_payload) if isinstance(cached_payload, dict) else cached_payload
 
     search_query = question
@@ -433,28 +485,25 @@ def ask_upload(question: str, user_id: str, document_ids: list[str] | None = Non
     raw_chunks = [group for group in raw_chunks if group]
 
     if DEBUG_RELEVANCE:
-        print(f"[DEBUG] raw_chunks groups: {len(raw_chunks)}, total rows: {sum(len(g) for g in raw_chunks)}")
-        print(f"[DEBUG] best rrf_score: {_best_score(raw_chunks)}, threshold: {RELEVANCE_THRESHOLD}")
-        for group in raw_chunks:
-            for row in sorted(group, key=lambda r: r[-1], reverse=True)[:3]:
-                print(f"[DEBUG CONTENT] score={row[-1]:.4f} {row[0][:200]!r}")
+        print(f"[DEBUG] raw_chunks groups: {len(raw_chunks)}, total rows: {sum(len(g) for g in raw_chunks)}", flush=True)
+        print(f"[DEBUG] best rrf_score: {_best_score(raw_chunks)}, threshold: {RELEVANCE_THRESHOLD}", flush=True)
 
     if not raw_chunks or (not is_multi_doc and not _is_relevant(raw_chunks)):
         search_query = contextualize_question(question, user_id, mode="doc")
         if DEBUG_RELEVANCE:
-            print(f"[DEBUG] rewritten query: {search_query}")
+            print(f"[DEBUG] rewritten query: {search_query}", flush=True)
         reworded_chunks = related_chunks_per_doc(
             user_id=user_id, question=search_query, document_ids=document_ids, k_per_doc=10
         )
         reworded_chunks = [group for group in reworded_chunks if group]
         if DEBUG_RELEVANCE:
-            print(f"[DEBUG] reworded_chunks groups: {len(reworded_chunks)}")
+            print(f"[DEBUG] reworded_chunks groups: {len(reworded_chunks)}", flush=True)
         if reworded_chunks:
             raw_chunks = reworded_chunks
 
     if not raw_chunks:
         if DEBUG_RELEVANCE:
-            print("[DEBUG] EXIT: raw_chunks empty after retry -> NOT_ENOUGH_INFO")
+            print("[DEBUG] EXIT: raw_chunks empty after retry -> NOT_ENOUGH_INFO", flush=True)
         return NOT_ENOUGH_INFO
 
     if is_multi_doc:
@@ -463,17 +512,20 @@ def ask_upload(question: str, user_id: str, document_ids: list[str] | None = Non
         top_chunks = select_top_chunks(raw_chunks, top_k=TOP_K)
 
     if DEBUG_RELEVANCE:
-        print(f"[DEBUG] top_chunks selected: {len(top_chunks)}")
+        print(f"[DEBUG] top_chunks selected: {len(top_chunks)}", flush=True)
 
     if not top_chunks:
         if DEBUG_RELEVANCE:
-            print("[DEBUG] EXIT: top_chunks empty -> NOT_ENOUGH_INFO")
+            print("[DEBUG] EXIT: top_chunks empty -> NOT_ENOUGH_INFO", flush=True)
         return NOT_ENOUGH_INFO
+
+    # Prints exactly the chunks that are sent to the LLM.
+    _debug_print_chunks("ask_upload", search_query, top_chunks, mode="doc")
 
     labels = list({row[2] for row in top_chunks if len(row) > 2 and row[2]})
     ans = generate_answer(question=search_query, context_chunks=top_chunks, user_id=user_id, mode="doc", labels=labels)
     if DEBUG_RELEVANCE:
-        print(f"[DEBUG] final answer starts with: {ans[:80]}")
+        print(f"[DEBUG] final answer starts with: {ans[:80]}", flush=True)
 
     save_to_cache(mode="doc", doc_ids=document_ids, question=question, response={"answer": ans}, ttl=86400)
     return ans
