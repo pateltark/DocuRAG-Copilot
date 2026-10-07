@@ -133,7 +133,7 @@ def _run_migrations():
         cursor.execute("ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS mode VARCHAR(20) DEFAULT 'sec';")
         cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ready';")
 
-        # ── NEW: chat_id groups messages into a "chat section" (sidebar entry).
+        # chat_id groups messages into a "chat section" (sidebar entry).
         # Nullable so old rows (pre-migration) don't break; new chats always set it.
         cursor.execute("ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS chat_id UUID;")
         cursor.execute("""
@@ -161,7 +161,7 @@ def _run_migrations():
                     GENERATED ALWAYS AS (
                         to_tsvector('english', coalesce(content,''))
                     ) STORED;
-         
+
                     """)
 
         cursor.execute("""
@@ -202,9 +202,6 @@ def save_sec_vector(document_id: int, ticker: str, form_type: str, filename: str
 
 
 def related_sec_chunks(document_id: int, question: str, k: int = 5, k_rrf: int = 60):
-    # FIX: was referencing an undefined module-level `model` (only ever
-    # commented out at the top of this file) — every call threw
-    # NameError. Load it the same way related_chunks()/related_chunks_per_doc() do.
     model = get_embedding_model()
     query_embedding = json.dumps(model.encode(question).tolist())
 
@@ -255,6 +252,8 @@ def related_sec_chunks(document_id: int, question: str, k: int = 5, k_rrf: int =
             k
         ))
         rows = cursor.fetchall()
+
+    print(f"[DB] related_sec_chunks: similarity search retrieved {len(rows)} chunks", flush=True)
 
     return [(row[0], row[1], row[2], row[3], row[4]) for row in rows]
 
@@ -482,6 +481,8 @@ def related_chunks(user_id: str, question: str, k: int = 4, document_ids: list[s
         cursor.execute(sql, all_params)
         rows = cursor.fetchall()
 
+    print(f"[DB] related_chunks: similarity search retrieved {len(rows)} chunks", flush=True)
+
     return [(row[0], row[1], row[2]) for row in rows]
 
 
@@ -558,8 +559,14 @@ def related_chunks_per_doc(
                     k_per_doc
                 )
             )
-            results.append(cursor.fetchall())
-            
+            rows = cursor.fetchall()
+            print(
+                f"[DB] related_chunks_per_doc: similarity search retrieved "
+                f"{len(rows)} chunks for doc {str(doc_id)[:8]}",
+                flush=True,
+            )
+            results.append(rows)
+
     return results
 
 

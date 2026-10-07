@@ -40,7 +40,7 @@ RELEVANCE_THRESHOLD = 0.01
 # Set DEBUG_RELEVANCE=1 in your .env (or in the shell) to print retrieval info.
 DEBUG_RELEVANCE = os.getenv("DEBUG_RELEVANCE") == "1"
 
-TOP_K = 4
+TOP_K = 7
 
 
 # ── Answer cleaning ─────────────────────────────────────────
@@ -511,8 +511,7 @@ def ask_upload(question: str, user_id: str, document_ids: list[str] | None = Non
     else:
         top_chunks = select_top_chunks(raw_chunks, top_k=TOP_K)
 
-    if DEBUG_RELEVANCE:
-        print(f"[DEBUG] top_chunks selected: {len(top_chunks)}", flush=True)
+    print(f"[ask_upload] sent to LLM: {len(top_chunks)} chunks", flush=True)
 
     if not top_chunks:
         if DEBUG_RELEVANCE:
