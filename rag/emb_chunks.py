@@ -68,8 +68,8 @@ def ingest_text(
     document_id = clean_string(document_id)
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,
-        chunk_overlap=60,
+        chunk_size=1000,
+        chunk_overlap=200,
     )
 
     docs = [
@@ -116,6 +116,7 @@ def ingest_sec_text(
         chunk_overlap=200,
     )
     chunks = splitter.split_text(text)
+
     embeddings = model.encode(chunks)
 
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
@@ -144,9 +145,10 @@ def create_vectorstore(
     clean_doc_id = clean_string(document_id)
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,
-        chunk_overlap=60,
-    )
+    chunk_size=1000,      # ~200-250 tokens (ideal sweet spot for BGE-base)
+    chunk_overlap=150,     # ~15% overlap to keep semantic transitions intact
+    separators=["\n\n", "\n", ". ", " ", ""]
+      )
 
     reader = PdfReader(pdf_path)
     any_content_found = False

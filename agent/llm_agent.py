@@ -40,7 +40,7 @@ RELEVANCE_THRESHOLD = 0.01
 # Set DEBUG_RELEVANCE=1 in your .env (or in the shell) to print retrieval info.
 DEBUG_RELEVANCE = os.getenv("DEBUG_RELEVANCE") == "1"
 
-TOP_K = 7
+TOP_K = 20
 
 
 # ── Answer cleaning ─────────────────────────────────────────
