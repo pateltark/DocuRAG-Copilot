@@ -97,7 +97,7 @@ def _run_migrations():
                 chunk_index INTEGER NOT NULL,
                 content TEXT NOT NULL,
 
-                embedding VECTOR(384),
+                embedding VECTOR(768),
 
                 content_tsvector TSVECTOR GENERATED ALWAYS AS (
                     to_tsvector('english', coalesce(content,''))
@@ -113,7 +113,7 @@ def _run_migrations():
 
                 content TEXT NOT NULL,
 
-                embedding VECTOR(384),
+                embedding VECTOR(768),
 
                 content_tsvector TSVECTOR GENERATED ALWAYS AS (
                     to_tsvector('english', coalesce(content,''))
