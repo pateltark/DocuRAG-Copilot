@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔎 <YOUR-PROJECT-NAME>
+# 🔎 DocuRAG-Copilot
 
 ### Production-grade Retrieval-Augmented Generation with Hybrid Search, Semantic Caching & Cloud Deployment
 
@@ -103,12 +103,13 @@ flowchart LR
 | **Caching** | Redis |
 | **Containerization** | Docker |
 | **Cloud / Deployment** | AWS ECS |
-| **LLM** | `<your LLM, e.g. OpenAI / Claude / Llama>` |
-| **Embeddings** | `<your embedding model>` |
-| **API Framework** | `<e.g. FastAPI>` |
-| **Vector Store** | `<e.g. Redis Stack / pgvector / Qdrant>` |
-| **Orchestration** | `<e.g. LangChain / LlamaIndex / custom>` |
-| **CI/CD** | `<e.g. GitHub Actions>` |
+| **LLM** | `Groq API` |
+| **Embeddings** | `BAAI/bge-base-en-v1.5` |
+| **API Framework** | `FastAPI` |
+| **Vector Store** | `pgvector` |
+| **Database** | `Redis, PSQL` |
+| **Orchestration** | `custom` |
+
 
 ---
 
@@ -136,8 +137,8 @@ flowchart LR
 
 ### 1. Clone
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+https://github.com/pateltark/DocuRAG-Copilot.git
+cd DocuRAG-Copilot
 ```
 
 ### 2. Configure
